@@ -804,6 +804,87 @@ const escapeRegExp = (value) => value.replace(
 );
 
 /**
+ * Revel keeps the entire report state in the URL fragment as
+ * JSON with its quotes and spaces percent-encoded:
+ *
+ *   #{%22aggregate_format%22:%22hours%22,%22show_discounts%22:%221%22,
+ *     %22range_from%22:%2209/01/2026%2000:00:00%22, ...}
+ *
+ * Reproducing that encoding exactly matters: encodeURIComponent
+ * would also escape the braces, colons and commas that Revel leaves
+ * literal.
+ */
+const encodeReportState = (state) => JSON.stringify(state)
+    .replace(/"/g, '%22')
+    .replace(/ /g, '%20');
+
+async function readReportState(page) {
+    return page.evaluate(() => {
+        const raw = window.location.hash.replace(/^#/, '');
+
+        if (!raw) return null;
+
+        try {
+            return JSON.parse(decodeURIComponent(raw));
+        } catch {
+            return null;
+        }
+    });
+}
+
+/**
+ * The aggregate_format token Revel uses for each view, read from the
+ * <select> that Select2 wraps. Reading them beats hardcoding,
+ * because Revel's spelling for the 15-minute bucket is not
+ * something we can see from the rendered page.
+ */
+async function readViewTokens(page, knownViews) {
+    return page.evaluate((known) => {
+        const textOf = (option) => (option.textContent ?? '').trim();
+
+        const select = [...document.querySelectorAll('select')].find(
+            (candidate) => {
+                const labels = [...candidate.options].map(textOf);
+
+                return known.filter(
+                    (label) => labels.includes(label),
+                ).length >= 2;
+            },
+        );
+
+        if (!select) return null;
+
+        return Object.fromEntries(
+            [...select.options].map(
+                (option) => [textOf(option), option.value],
+            ),
+        );
+    }, knownViews);
+}
+
+/**
+ * Work out which buckets the rendered table uses. Hourly rows end at
+ * :59, so a row ending at :14, :29 or :44 is the only reliable
+ * signal that the 15-minute view is really in effect. Quarter-hour
+ * tables also contain :59 rows, so that test has to come first.
+ */
+async function readReportGranularity(page) {
+    return page.evaluate(() => {
+        const text = document.body.innerText;
+
+        if (/\d{1,2}:(14|29|44)\s*(AM|PM)/i.test(text)) return 'quarter';
+        if (/\d{1,2}:59\s*(AM|PM)/i.test(text)) return 'hourly';
+
+        return 'unknown';
+    });
+}
+
+const VIEW_GRANULARITY = {
+    Hourly: 'hourly',
+    '15 Min': 'quarter',
+};
+
+/**
  * The report's aggregation dropdown, rendered with Select2 v3. Revel
  * labels it with the active aggregation plus a "View" suffix, for
  * example "Hourly View" or "15 Min View". Matching on "View" keeps
@@ -833,126 +914,104 @@ const matchesView = (label, viewLabel) => label
     .toLowerCase()
     .startsWith(viewLabel.toLowerCase());
 
-async function waitForReportViewLabel(page, viewLabel, timeoutMs = 15_000) {
+/**
+ * A view is only really applied when the control agrees *and* the
+ * table is bucketed accordingly. Checking the label alone is not
+ * enough: Select2 updates its own label the moment its value is set,
+ * which made an earlier run report success while Revel quietly kept
+ * serving the previous aggregation.
+ */
+async function waitForReportView(page, viewLabel, timeoutMs) {
+    const expected = VIEW_GRANULARITY[viewLabel] ?? null;
     const deadline = Date.now() + timeoutMs;
+
     let label = '';
+    let granularity = 'unknown';
 
     while (Date.now() < deadline) {
         // eslint-disable-next-line no-await-in-loop
         label = await readReportView(page);
+        // eslint-disable-next-line no-await-in-loop
+        granularity = await readReportGranularity(page).catch(
+            () => 'unknown',
+        );
 
-        if (matchesView(label, viewLabel)) return true;
+        const labelAgrees = matchesView(label, viewLabel);
+        const tableAgrees = !expected || granularity === expected;
+
+        if (labelAgrees && tableAgrees) return true;
 
         // eslint-disable-next-line no-await-in-loop
-        await page.waitForTimeout(250);
+        await page.waitForTimeout(500);
     }
 
     log.warning(
-        `The report view control still reads "${label}" `
-        + `instead of "${viewLabel}".`,
+        `Report view not confirmed: the control reads "${label}" `
+        + `and the table is bucketed "${granularity}" `
+        + `(wanted "${viewLabel}"/"${expected ?? 'any'}").`,
     );
 
     return false;
 }
 
 /**
- * Drive the aggregation dropdown through the <select> that Select2
- * keeps in the DOM.
+ * Rewrite aggregate_format in the URL fragment and reload.
  *
- * Clicking the rendered list is unreliable here: Select2 v3 commits
- * whichever option its own mousemove handler highlighted, so a
- * synthetic click can close the list without changing the value,
- * leaving the report on its previous aggregation.
+ * The fragment is where Revel actually stores the report state, and
+ * it survives a reload along with the dates and filter selections,
+ * which makes this the one deterministic route. It has to run after
+ * the filters are applied so their state is already in the fragment.
  */
-async function setReportViewByValue(page, viewLabel, knownViews) {
-    return page.evaluate(
-        ({ target, known }) => {
-            const textOf = (option) => (option.textContent ?? '').trim();
+async function setReportViewByState(page, token) {
+    const state = await readReportState(page);
 
-            /*
-             * Identify the control by its option set. Revel
-             * regenerates element ids per render, but the three view
-             * names are stable.
-             */
-            const select = [...document.querySelectorAll('select')].find(
-                (candidate) => {
-                    const labels = [...candidate.options].map(textOf);
+    if (!state) {
+        log.warning(
+            'Could not read the report state from the URL fragment.',
+        );
 
-                    return labels.includes(target) && known.some(
-                        (label) => label !== target
-                            && labels.includes(label),
-                    );
-                },
-            );
+        return false;
+    }
 
-            if (!select) {
-                return { ok: false, reason: 'no-select', options: [] };
-            }
-
-            const options = [...select.options].map(textOf);
-            const option = [...select.options].find(
-                (candidate) => textOf(candidate) === target,
-            );
-
-            if (!option) {
-                return { ok: false, reason: 'no-option', options };
-            }
-
-            const jq = window.jQuery ?? window.$;
-
-            /*
-             * Select2 v3 exposes a "val" setter whose third argument
-             * fires the change event Revel listens on.
-             */
-            if (jq && jq.fn && jq.fn.select2) {
-                jq(select).select2('val', option.value, true);
-
-                return { ok: true, reason: 'select2-api', options };
-            }
-
-            select.value = option.value;
-
-            if (jq) {
-                jq(select).trigger('change');
-
-                return { ok: true, reason: 'jquery-change', options };
-            }
-
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-
-            return { ok: true, reason: 'native-change', options };
-        },
-        { target: viewLabel, known: knownViews },
+    log.info(
+        `Rewriting the report state: aggregate_format `
+        + `"${state.aggregate_format}" -> "${token}".`,
     );
+
+    await page.evaluate(
+        (encoded) => { window.location.hash = `#${encoded}`; },
+        encodeReportState({ ...state, aggregate_format: token }),
+    );
+
+    await page.reload({
+        waitUntil: 'domcontentloaded',
+        timeout: 90_000,
+    });
+
+    await waitForReportToSettle(page);
+
+    return true;
 }
 
 /**
- * Fallback for when Select2 is attached to something other than a
- * <select>. Hovering first gives Select2's highlight handler a
- * chance to run before the mouse goes down.
+ * Close any open Select2 list before a fresh attempt, so clicking
+ * the control opens the list rather than dismissing it.
  */
-async function clickReportView(page, viewLabel) {
-    await reportViewControl(page).click();
-
+async function dismissViewDropdown(page) {
     const dropdown = page.locator('#select2-drop');
 
-    await dropdown.waitFor({ state: 'visible', timeout: 20_000 });
+    if (await dropdown.isVisible().catch(() => false)) {
+        await page.keyboard.press('Escape');
+        await dropdown
+            .waitFor({ state: 'hidden', timeout: 5_000 })
+            .catch(() => {});
+    }
+}
 
-    const optionLabels = dropdown.locator('.select2-result-label');
-
-    await optionLabels.first().waitFor({
-        state: 'visible',
-        timeout: 20_000,
-    });
-
-    const offered = (await optionLabels.allInnerTexts())
-        .map((text) => text.trim());
-
-    log.info(`Report view options offered: ${offered.join(', ')}`);
-
-    await saveScreenshot(page, 'REVEL_VIEW_DROPDOWN_OPEN');
-
-    const option = optionLabels
+function viewOption(page, viewLabel) {
+    return page
+        .locator('#select2-drop')
+        .locator('.select2-result-label')
         .filter({
             hasText: new RegExp(
                 `^\\s*${escapeRegExp(viewLabel)}\\s*$`,
@@ -960,102 +1019,210 @@ async function clickReportView(page, viewLabel) {
             ),
         })
         .first();
+}
+
+/**
+ * Click the option, the way this originally worked.
+ *
+ * Select2 v3 commits whichever option its own mousemove handler
+ * highlighted, not the one under the mouseup, and it filters
+ * mousemove events by coordinate. So the pointer is moved twice to
+ * guarantee a coordinate change, then given a moment before the
+ * button goes down. Even so this route is only intermittently
+ * reliable, which is why callers retry it.
+ */
+async function setReportViewByClick(page, viewLabel) {
+    await dismissViewDropdown(page);
+    await reportViewControl(page).click();
+
+    const dropdown = page.locator('#select2-drop');
+
+    await dropdown.waitFor({ state: 'visible', timeout: 20_000 });
+
+    const option = viewOption(page, viewLabel);
 
     if (await option.count() === 0) {
+        log.warning(`The view dropdown does not offer "${viewLabel}".`);
         await page.keyboard.press('Escape');
 
         return false;
     }
 
-    await option.hover();
-    await page.waitForTimeout(150);
-    await option.click();
+    const box = await option.boundingBox();
+
+    if (!box) {
+        log.warning('The view option has no bounding box.');
+        await page.keyboard.press('Escape');
+
+        return false;
+    }
+
+    await page.mouse.move(box.x + 4, box.y + 4);
+    await page.mouse.move(
+        box.x + (box.width / 2),
+        box.y + (box.height / 2),
+    );
+    await page.waitForTimeout(200);
+    await page.mouse.down();
+    await page.mouse.up();
 
     await dropdown
-        .waitFor({ state: 'hidden', timeout: 20_000 })
-        .catch(() => {
-            log.warning('The report view dropdown stayed open.');
-        });
+        .waitFor({ state: 'hidden', timeout: 10_000 })
+        .catch(() => {});
 
-    return waitForReportViewLabel(page, viewLabel);
+    await waitForReportToSettle(page);
+
+    return true;
+}
+
+/**
+ * Pick the view with the keyboard. Select2 v3 sets its highlight on
+ * the arrow keys and commits it on Enter, so this runs the same
+ * handler chain as a real click without depending on whether a
+ * synthetic mousemove survived Select2's coordinate filter.
+ */
+async function setReportViewByKeyboard(page, viewLabel) {
+    await dismissViewDropdown(page);
+    await reportViewControl(page).click();
+
+    const dropdown = page.locator('#select2-drop');
+
+    await dropdown.waitFor({ state: 'visible', timeout: 20_000 });
+    await saveScreenshot(page, 'REVEL_VIEW_DROPDOWN_OPEN');
+
+    const wanted = new RegExp(
+        `^\\s*${escapeRegExp(viewLabel)}\\s*$`,
+        'i',
+    );
+
+    const highlighted = dropdown.locator('.select2-highlighted').first();
+
+    for (let step = 0; step < 12; step += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const current = await highlighted
+            .innerText()
+            .catch(() => '');
+
+        if (wanted.test(current.trim())) {
+            // eslint-disable-next-line no-await-in-loop
+            await page.keyboard.press('Enter');
+
+            // eslint-disable-next-line no-await-in-loop
+            await dropdown
+                .waitFor({ state: 'hidden', timeout: 10_000 })
+                .catch(() => {});
+
+            // eslint-disable-next-line no-await-in-loop
+            await waitForReportToSettle(page);
+
+            return true;
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        await page.keyboard.press('ArrowDown');
+        // eslint-disable-next-line no-await-in-loop
+        await page.waitForTimeout(150);
+    }
+
+    log.warning(
+        `Never highlighted "${viewLabel}" in the view dropdown.`,
+    );
+
+    await page.keyboard.press('Escape');
+
+    return false;
 }
 
 async function selectReportView(page, viewLabel) {
-    const control = reportViewControl(page);
+    await reportViewControl(page).waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
 
-    await control.waitFor({ state: 'visible', timeout: 20_000 });
-
-    const currentLabel = (await control.innerText()).trim();
-
-    if (matchesView(currentLabel, viewLabel)) {
-        log.info(`Report view is already "${currentLabel}".`);
+    if (await waitForReportView(page, viewLabel, 1_000)) {
+        log.info(`Report view is already "${viewLabel}".`);
 
         return;
     }
 
     log.info(
-        `Switching the report view from "${currentLabel}" `
-        + `to "${viewLabel}".`,
+        `Switching the report view from `
+        + `"${await readReportView(page)}" to "${viewLabel}".`,
     );
 
-    const result = await setReportViewByValue(
-        page,
-        viewLabel,
-        REPORT_VIEWS,
-    );
+    const tokens = await readViewTokens(page, REPORT_VIEWS);
 
-    log.info(
-        `Aggregation select update: ${result.reason}. `
-        + `Options found: ${result.options.join(', ') || 'none'}`,
-    );
-
-    let switched = result.ok
-        && await waitForReportViewLabel(page, viewLabel);
-
-    if (!switched) {
+    if (tokens) {
+        log.info(
+            `Revel's aggregate_format tokens: ${Object.entries(tokens)
+                .map(([label, token]) => `${label}=${token}`)
+                .join(', ')}`,
+        );
+    } else {
         log.warning(
-            'Falling back to clicking the report view dropdown.',
-        );
-
-        switched = await clickReportView(page, viewLabel);
-    }
-
-    if (!switched) {
-        throw new Error(
-            `Unable to switch the report view to "${viewLabel}". `
-            + `The control still reads "${await readReportView(page)}".`,
+            'Could not find the view <select>, so the '
+            + 'aggregate_format token is unknown.',
         );
     }
 
-    log.info(`Report view is now "${await readReportView(page)}".`);
+    const token = tokens?.[viewLabel];
 
-    await waitForReportToSettle(page);
-}
+    /*
+     * Ordered cheapest and most faithful first. The click route is
+     * last and repeated because it is how this ran successfully
+     * before, but Select2 drops it often enough that one attempt is
+     * close to a coin flip.
+     */
+    const routes = [
+        {
+            name: 'keyboard',
+            timeoutMs: 30_000,
+            run: () => setReportViewByKeyboard(page, viewLabel),
+        },
+        ...(token
+            ? [{
+                name: 'report state rewrite',
+                timeoutMs: 45_000,
+                run: () => setReportViewByState(page, token),
+            }]
+            : []),
+        ...[1, 2, 3].map((attempt) => ({
+            name: `dropdown click ${attempt} of 3`,
+            timeoutMs: 30_000,
+            run: () => setReportViewByClick(page, viewLabel),
+        })),
+    ];
 
-/**
- * Confirm the rendered table really uses 15-minute buckets. Hourly
- * rows always end at :59, so a row ending at :14, :29 or :44 is the
- * distinguishing signal.
- */
-async function waitForQuarterHourRows(page) {
-    await page
-        .waitForFunction(
-            () => /\d{1,2}:(14|29|44)\s*(AM|PM)/i.test(
-                document.body.innerText,
-            ),
-            undefined,
-            {
-                timeout: 60_000,
-                polling: 500,
-            },
-        )
-        .catch(() => {
-            throw new Error(
-                'The report view control reads 15 Min but the table '
-                + 'still shows hourly rows, so Revel did not reload '
-                + 'the report.',
-            );
+    for (const { name, timeoutMs, run } of routes) {
+        log.info(`Trying the ${name} route.`);
+
+        // eslint-disable-next-line no-await-in-loop
+        const attempted = await run().catch((error) => {
+            log.warning(`The ${name} route threw: ${error.message}`);
+
+            return false;
         });
+
+        if (attempted
+            // eslint-disable-next-line no-await-in-loop
+            && await waitForReportView(page, viewLabel, timeoutMs)) {
+            log.info(
+                `Report view is now "${viewLabel}" `
+                + `via the ${name} route.`,
+            );
+
+            return;
+        }
+
+        log.warning(`The ${name} route did not switch the view.`);
+    }
+
+    throw new Error(
+        `Unable to switch the report view to "${viewLabel}" after `
+        + `${routes.length} attempts. The control reads `
+        + `"${await readReportView(page)}" and the table is bucketed `
+        + `"${await readReportGranularity(page)}".`,
+    );
 }
 
 /**
@@ -1891,9 +2058,40 @@ try {
 
             await selectReportView(page, reportView);
 
-            if (reportView === '15 Min') {
-                await waitForQuarterHourRows(page);
+            /*
+             * Switching the view can reload the page, so re-confirm
+             * what Revel is reporting on. Wrong-but-plausible
+             * numbers are worse than a failed run.
+             */
+            const establishmentNow = (
+                await page
+                    .locator('[data-cy="header-establishment-text"]')
+                    .textContent()
+            )?.trim() || 'Unknown';
+
+            if (!establishmentNow.includes(selectedEstablishment)) {
+                throw new Error(
+                    `Revel is now on establishment `
+                    + `"${establishmentNow}" but the report view `
+                    + `switch expected "${selectedEstablishment}".`,
+                );
             }
+
+            const rangeNow = (await reportDateRow.innerText())
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            if (rangeNow !== displayedRange) {
+                throw new Error(
+                    `The report range became "${rangeNow}" during the `
+                    + `report view switch; expected `
+                    + `"${displayedRange}".`,
+                );
+            }
+
+            log.info(
+                `Report confirmed for ${establishmentNow}: ${rangeNow}`,
+            );
 
             await saveScreenshot(page, 'REVEL_REPORT_READY');
 
