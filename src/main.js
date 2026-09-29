@@ -2,7 +2,6 @@ import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler } from 'crawlee';
-import * as XLSX from 'xlsx';
 import { createClient } from '@supabase/supabase-js';
 
 await Actor.init();
@@ -62,19 +61,30 @@ const INCLUSION_LABELS = {
 };
 
 /**
- * Report columns mapped to the header spellings Revel has used in
- * its Hourly Sales export. Matching is case-insensitive.
+ * Report columns mapped to the field names Revel has used across
+ * its JSON export and its rendered table. Aliases are stored in the
+ * normalized form produced by normalizeKey().
  */
 const COLUMN_ALIASES = {
-    transactions: ['# transactions', 'transactions'],
-    items: ['# items', 'items'],
-    avg_sales_per_check: [
-        'avg. sales/check',
-        'avg sales/check',
-        'average sales/check',
+    transactions: [
+        'transactions',
+        'numtransactions',
+        'transactioncount',
     ],
-    sales: ['sales', 'net sales'],
-    sales_percent: ['% sales', 'sales %', '% of sales'],
+    items: ['items', 'numitems', 'itemcount'],
+    avg_sales_per_check: [
+        'avgsalescheck',
+        'avgsalespercheck',
+        'averagesalescheck',
+    ],
+    sales: ['sales', 'netsales', 'totalsales'],
+    sales_percent: [
+        'pctsales',
+        'salespct',
+        'salespercent',
+        'percentsales',
+        'pctofsales',
+    ],
 };
 
 /**
@@ -231,32 +241,48 @@ function parseIntervalLabel(label) {
     };
 }
 
+/**
+ * Reduce a field name to letters and digits so "# Transactions",
+ * "transactions" and "num_transactions" all compare equal. "%" is
+ * spelled out first, otherwise "% Sales" and "Sales" would collide.
+ */
+function normalizeKey(value) {
+    return String(value)
+        .toLowerCase()
+        .replace(/%/g, 'pct')
+        .replace(/[^a-z0-9]/g, '');
+}
+
 function findColumnValue(record, aliases) {
     const entry = Object.entries(record).find(
-        ([header]) => aliases.includes(
-            String(header).trim().toLowerCase(),
-        ),
+        ([key]) => aliases.includes(normalizeKey(key)),
     );
 
     return entry ? entry[1] : null;
 }
 
 /**
- * Read a worksheet as a header row plus one record per data row.
- * Blank leading headers become positional names so the interval
- * column, which Revel exports unlabelled, still has a key.
+ * Revel labels the interval column differently between its export
+ * and its rendered table, so the field is found by the shape of its
+ * values rather than by name.
  */
-function worksheetToRecords(worksheet) {
-    const grid = XLSX.utils.sheet_to_json(worksheet, {
-        header: 1,
-        defval: null,
-        raw: true,
-        blankrows: false,
-    });
+function findIntervalField(records) {
+    const keys = records.length > 0 ? Object.keys(records[0]) : [];
 
-    if (grid.length < 2) {
-        return { headers: [], records: [] };
-    }
+    const match = keys.find((key) => records.some(
+        (record) => parseIntervalLabel(record[key]) !== null,
+    ));
+
+    return match ?? keys[0] ?? null;
+}
+
+/**
+ * Turn a header row plus data rows into records. Blank leading
+ * headers become positional names so the interval column, which
+ * Revel leaves unlabelled, still has a key.
+ */
+function rowsToRecords(grid) {
+    if (grid.length < 2) return [];
 
     const headers = (grid[0] ?? []).map((header, index) => {
         const text = header === null || header === undefined
@@ -268,7 +294,7 @@ function worksheetToRecords(worksheet) {
         return index === 0 ? 'Interval' : `Column ${index + 1}`;
     });
 
-    const records = grid
+    return grid
         .slice(1)
         .filter((row) => row.some(
             (cell) => cell !== null && String(cell).trim() !== '',
@@ -279,39 +305,91 @@ function worksheetToRecords(worksheet) {
                 row[index] ?? null,
             ]),
         ));
+}
 
-    return { headers, records };
+const isPlainObject = (value) => (
+    value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+);
+
+/**
+ * Find the row collections inside Revel's JSON export. The payload
+ * shape is undocumented and differs per report, so every array of
+ * objects is treated as one record set keyed by its path, and
+ * arrays of arrays are read as a header row plus data rows.
+ */
+function collectRecordSets(payload) {
+    const sets = {};
+
+    const visit = (value, path) => {
+        if (Array.isArray(value)) {
+            if (value.length === 0) return;
+
+            if (value.every(isPlainObject)) {
+                sets[path || 'root'] = value;
+
+                return;
+            }
+
+            if (value.every(Array.isArray)) {
+                const records = rowsToRecords(value);
+
+                if (records.length > 0) {
+                    sets[path || 'root'] = records;
+                }
+
+                return;
+            }
+
+            value.forEach(
+                (entry, index) => visit(entry, `${path}[${index}]`),
+            );
+
+            return;
+        }
+
+        if (isPlainObject(value)) {
+            for (const [key, nested] of Object.entries(value)) {
+                visit(nested, path ? `${path}.${key}` : key);
+            }
+        }
+    };
+
+    visit(payload, '');
+
+    return sets;
 }
 
 /**
- * Flatten every worksheet of the export into dataset rows keyed by
+ * Flatten every record set of the export into dataset rows keyed by
  * establishment, business date and interval.
  */
 function buildIntervalRows({
-    sheets,
+    recordSets,
     location,
     businessDate,
     reportView,
 }) {
     const rows = [];
 
-    for (const [sheetName, { headers, records }] of Object.entries(sheets)) {
-        const intervalHeader = headers[0];
+    for (const [setName, records] of Object.entries(recordSets)) {
+        const intervalField = findIntervalField(records);
 
         for (const record of records) {
-            const intervalLabel = intervalHeader
-                ? String(record[intervalHeader] ?? '').trim()
+            const intervalLabel = intervalField
+                ? String(record[intervalField] ?? '').trim()
                 : '';
 
             const interval = parseIntervalLabel(intervalLabel);
 
             rows.push({
-                id: `${businessDate}_${location}_${sheetName}`
+                id: `${businessDate}_${location}_${setName}`
                     + `_${intervalLabel || 'total'}`,
                 location,
                 business_date: businessDate,
                 report_view: reportView,
-                revenue_center: sheetName,
+                revenue_center: setName,
 
                 interval_label: intervalLabel,
                 interval_start: interval?.start ?? null,
@@ -804,7 +882,110 @@ async function waitForQuarterHourRows(page) {
 }
 
 /**
- * Read the rendered report table. Used when the Excel export is
+ * Request the JSON export from the report's three-dot menu.
+ *
+ * Revel posts `#export-form` with `target="_blank"`, so the export
+ * arrives either as a download or as a new tab rendering the JSON.
+ * Both are handled; whichever settles first wins.
+ */
+async function fetchReportJson(page) {
+    const exportMenuButton = page
+        .locator('.header-more .button-more:visible')
+        .first();
+
+    await exportMenuButton.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    log.info('Opening the report export menu.');
+
+    await exportMenuButton.click();
+
+    const jsonExportLink = page
+        .locator(
+            '#exp_json:visible, '
+            + 'a[data-exporttype="JSON"]:visible, '
+            + 'a[data-exporttype="json"]:visible',
+        )
+        .first();
+
+    await jsonExportLink.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    await saveScreenshot(page, 'REVEL_EXPORT_MENU_OPEN');
+
+    log.info('Requesting the Hourly Sales JSON export.');
+
+    const downloadPromise = page
+        .waitForEvent('download', { timeout: 60_000 })
+        .then((download) => ({ kind: 'download', download }))
+        .catch(() => null);
+
+    const popupPromise = page
+        .context()
+        .waitForEvent('page', { timeout: 60_000 })
+        .then((popup) => ({ kind: 'popup', popup }))
+        .catch(() => null);
+
+    await jsonExportLink.click();
+
+    const delivery = await Promise.race([
+        downloadPromise,
+        popupPromise,
+    ]);
+
+    if (!delivery) {
+        throw new Error(
+            'Revel did not deliver the JSON export as a download '
+            + 'or in a new tab.',
+        );
+    }
+
+    if (delivery.kind === 'download') {
+        const failure = await delivery.download.failure();
+
+        if (failure) {
+            throw new Error(`JSON download failed: ${failure}`);
+        }
+
+        const temporaryFilePath = await delivery.download.path();
+
+        if (!temporaryFilePath) {
+            throw new Error(
+                'Playwright did not provide a path '
+                + 'for the downloaded export.',
+            );
+        }
+
+        return {
+            text: await readFile(temporaryFilePath, 'utf8'),
+            source: 'json-download',
+        };
+    }
+
+    const { popup } = delivery;
+
+    await popup.waitForLoadState('domcontentloaded');
+
+    /*
+     * Chromium renders a JSON response inside a <pre>. Fall back to
+     * the body in case Revel serves it as an HTML document.
+     */
+    const text = await popup.evaluate(
+        () => document.querySelector('pre')?.innerText
+            ?? document.body.innerText,
+    );
+
+    await popup.close();
+
+    return { text, source: 'json-tab' };
+}
+
+/**
+ * Read the rendered report table. Used when the JSON export is
  * unavailable so a run still produces data.
  */
 async function scrapeReportTable(page) {
@@ -831,23 +1012,7 @@ async function scrapeReportTable(page) {
         );
     }
 
-    const headers = table[0].map((header, index) => {
-        if (header !== '') return header;
-
-        return index === 0 ? 'Interval' : `Column ${index + 1}`;
-    });
-
-    const records = table
-        .slice(1)
-        .filter((row) => row.some((cell) => cell !== ''))
-        .map((row) => Object.fromEntries(
-            headers.map((header, index) => [
-                header,
-                row[index] ?? null,
-            ]),
-        ));
-
-    return { 'Rendered table': { headers, records } };
+    return { 'Rendered table': rowsToRecords(table) };
 }
 
 let exitCode = 0;
@@ -1559,98 +1724,72 @@ try {
                 `Hourly Sales is ready in the "${reportView}" view.`,
             );
 
-            /*
-             * Prefer the Excel export: it carries the same columns as
-             * the table without the rendering truncation.
-             */
-            let sheets;
+            let recordSets;
             let source;
-            let sourceSizeBytes = null;
-            let sheetNames = [];
+            let rawSizeBytes = null;
 
             try {
-                const exportMenuButton = page
-                    .locator('.header-more .button-more:visible')
-                    .first();
+                const { text, source: jsonSource } =
+                    await fetchReportJson(page);
 
-                await exportMenuButton.waitFor({
-                    state: 'visible',
-                    timeout: 20_000,
-                });
-
-                log.info('Opening the report export menu.');
-
-                await exportMenuButton.click();
-
-                const excelExportLink = page
-                    .locator('[data-exporttype="excel"]:visible')
-                    .first();
-
-                await excelExportLink.waitFor({
-                    state: 'visible',
-                    timeout: 20_000,
-                });
-
-                await saveScreenshot(page, 'REVEL_EXPORT_MENU_OPEN');
-
-                log.info('Downloading the Hourly Sales Excel report.');
-
-                const downloadPromise = page.waitForEvent('download', {
-                    timeout: 60_000,
-                });
-
-                await excelExportLink.click();
-
-                const download = await downloadPromise;
-                const downloadFailure = await download.failure();
-
-                if (downloadFailure) {
-                    throw new Error(
-                        `Excel download failed: ${downloadFailure}`,
-                    );
-                }
-
-                const temporaryFilePath = await download.path();
-
-                if (!temporaryFilePath) {
-                    throw new Error(
-                        'Playwright did not provide a path '
-                        + 'for the downloaded file.',
-                    );
-                }
-
-                const excelBuffer = await readFile(temporaryFilePath);
-
-                const workbook = XLSX.read(excelBuffer, {
-                    type: 'buffer',
-                    cellDates: false,
-                });
-
-                sheets = Object.fromEntries(
-                    workbook.SheetNames.map((sheetName) => [
-                        sheetName,
-                        worksheetToRecords(workbook.Sheets[sheetName]),
-                    ]),
+                /*
+                 * Keep the untouched payload. Revel's JSON shape is
+                 * undocumented, so this is the reference for fixing
+                 * any field that maps to null.
+                 */
+                await Actor.setValue(
+                    'REVEL_HOURLY_SALES_RAW',
+                    text,
+                    { contentType: 'application/json' },
                 );
 
-                source = 'excel-export';
-                sourceSizeBytes = excelBuffer.length;
-                sheetNames = workbook.SheetNames;
+                rawSizeBytes = Buffer.byteLength(text);
+
+                let payload;
+
+                try {
+                    payload = JSON.parse(text);
+                } catch (parseError) {
+                    throw new Error(
+                        `The export was not valid JSON `
+                        + `(${parseError.message}). First 200 chars: `
+                        + `${text.slice(0, 200)}`,
+                    );
+                }
+
+                recordSets = collectRecordSets(payload);
+
+                if (Object.keys(recordSets).length === 0) {
+                    throw new Error(
+                        'The JSON export contained no row '
+                        + 'collections. See REVEL_HOURLY_SALES_RAW.',
+                    );
+                }
+
+                source = jsonSource;
             } catch (exportError) {
                 log.warning(
-                    `Excel export unavailable, falling back to the `
+                    `JSON export unavailable, falling back to the `
                     + `rendered table: ${exportError.message}`,
                 );
 
-                sheets = await scrapeReportTable(page);
+                recordSets = await scrapeReportTable(page);
                 source = 'rendered-table';
-                sheetNames = Object.keys(sheets);
             }
+
+            const recordSetNames = Object.keys(recordSets);
+
+            log.info(
+                `Export read from ${source}. Record sets: `
+                + `${recordSetNames.map((name) => (
+                    `${name} (${recordSets[name].length})`
+                )).join(', ')}`,
+            );
 
             const businessDate = toIsoDate(startDate);
 
             const intervalRows = buildIntervalRows({
-                sheets,
+                recordSets,
                 location: selectedEstablishment,
                 businessDate,
                 reportView,
@@ -1668,7 +1807,7 @@ try {
 
             log.info(
                 `Parsed ${intervalRows.length} rows `
-                + `(${intervalCount} intervals) from ${source}.`,
+                + `(${intervalCount} intervals).`,
             );
 
             if (supabaseTable) {
@@ -1713,8 +1852,8 @@ try {
                 endMeridiem: normalizedEndMeridiem,
                 displayedRange,
                 source,
-                sheetNames,
-                sourceSizeBytes,
+                recordSetNames,
+                rawSizeBytes,
                 rowCount: intervalRows.length,
                 intervalCount,
                 supabaseTable: supabaseTable || null,

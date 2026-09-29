@@ -27,9 +27,11 @@ and end date.
    report already matches the form).
 6. Switches the view dropdown to **15 Min** and verifies the table
    really rendered quarter-hour buckets before reading it.
-7. Exports the report to Excel through the three-dot menu and parses
-   every worksheet. If the export is unavailable the Actor falls back
-   to scraping the rendered table so the run still produces data.
+7. Exports the report as JSON through the three-dot menu
+   (`a#exp_json`). Revel posts its export form with `target="_blank"`,
+   so the payload arrives either as a download or as a new tab; both
+   are handled. If the export is unavailable the Actor falls back to
+   scraping the rendered table so the run still produces data.
 
 ## Input
 
@@ -48,7 +50,8 @@ and end date.
 
 ## Output
 
-Each dataset row represents one interval of one worksheet:
+Each dataset row represents one interval of one record set in the
+export:
 
 ```json
 {
@@ -74,10 +77,24 @@ Each dataset row represents one interval of one worksheet:
 Rows that Revel emits as report totals rather than intervals keep
 `is_total: true` and null interval times.
 
-A `RUN_SUMMARY` record plus step-by-step screenshots
-(`REVEL_LOGIN_START`, `REVEL_FILTERS_SELECTED`, `REVEL_REPORT_READY`,
-and so on) land in the run's key-value store, which is the fastest way
-to diagnose a selector that Revel has changed.
+Revel's JSON shape is undocumented, so field mapping is best-effort:
+`transactions`, `items`, `avg_sales_per_check`, `sales` and
+`sales_percent` are matched against a list of known field-name
+spellings, and `raw_data` always carries the untouched record. The
+interval column is identified by the *shape* of its values rather than
+its name, since Revel labels it differently between the export and the
+rendered table.
+
+The run's key-value store holds:
+
+- `REVEL_HOURLY_SALES_RAW` — the unmodified JSON payload. Check this
+  first if a mapped field comes back `null`; add the real field name to
+  `COLUMN_ALIASES` in `src/main.js`.
+- `RUN_SUMMARY` — status, the resolved date range, `source`
+  (`json-tab`, `json-download` or `rendered-table`), and row counts.
+- Step-by-step screenshots (`REVEL_LOGIN_START`,
+  `REVEL_FILTERS_SELECTED`, `REVEL_REPORT_READY`, and so on), which are
+  the fastest way to diagnose a selector that Revel has changed.
 
 ## Supabase
 
