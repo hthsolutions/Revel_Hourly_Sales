@@ -401,17 +401,45 @@ async function waitForReportToSettle(page) {
 }
 
 /**
- * Locate one column of the Filters panel. Revel gives each column a
- * class, and the heading text is the fallback when a class differs
- * between report types.
+ * The Filters panel. Its wrapper collapses to zero height because
+ * the panel is absolutely positioned, so Playwright reads the
+ * wrapper as hidden even while the panel is on screen. The form
+ * that owns `ul.form-wrapper` is the anchor that actually has a
+ * bounding box.
+ */
+function filterForm(page) {
+    return page.locator('form:has(ul.form-wrapper)').first();
+}
+
+/**
+ * Locate one column of the Filters panel. Revel gives most columns
+ * a class, but not all of them (Inclusions has a bare `li`), so the
+ * heading text is the fallback.
  */
 function filterSection(page, className, heading) {
-    return page
+    return filterForm(page)
         .locator(
-            `#form-filter li.${className}, `
-            + `#form-filter li:has(> div.heading:text-is("${heading}"))`,
+            `ul.form-wrapper > li.${className}, `
+            + `ul.form-wrapper > li:has(div.heading:text-is("${heading}"))`,
         )
         .first();
+}
+
+/**
+ * Resolve a Filters column, failing loudly rather than silently
+ * leaving the report on whatever Revel had saved for the account.
+ */
+async function requireSection(page, className, heading) {
+    const section = filterSection(page, className, heading);
+
+    if (await section.count() === 0) {
+        throw new Error(
+            `The "${heading}" column was not found in the Filters `
+            + 'panel. Revel may have changed its markup.',
+        );
+    }
+
+    return section;
 }
 
 function filtersToggle(page) {
@@ -422,23 +450,36 @@ function filtersToggle(page) {
 }
 
 async function openFilterPanel(page) {
-    const panel = page.locator('#form-filter');
+    const form = filterForm(page);
 
-    if (await panel.isVisible().catch(() => false)) return;
+    if (!await form.isVisible().catch(() => false)) {
+        const toggle = filtersToggle(page);
 
-    const toggle = filtersToggle(page);
+        await toggle.waitFor({
+            state: 'visible',
+            timeout: 20_000,
+        });
 
-    await toggle.waitFor({
-        state: 'visible',
-        timeout: 20_000,
-    });
+        await toggle.click();
 
-    await toggle.click();
+        await form.waitFor({
+            state: 'visible',
+            timeout: 20_000,
+        });
+    }
 
-    await panel.waitFor({
-        state: 'visible',
-        timeout: 20_000,
-    });
+    /*
+     * Log the columns Revel rendered. When a selector drifts, this
+     * line shows exactly what the panel looked like at the time.
+     */
+    const headings = await form
+        .locator('ul.form-wrapper > li div.heading')
+        .allInnerTexts();
+
+    log.info(
+        `Filters panel open with columns: `
+        + `${headings.map((text) => text.trim()).join(', ')}`,
+    );
 }
 
 /**
@@ -461,18 +502,17 @@ async function setControl(inputLocator, shouldBeChecked) {
  * Select the "All (Default)" radio of a Filters column.
  */
 async function selectAllRadio(page, className, heading, inputName) {
-    const section = filterSection(page, className, heading);
+    const section = await requireSection(page, className, heading);
 
     const allRadio = section
         .locator(`input[type="radio"][name="${inputName}"][value=""]`)
         .first();
 
     if (await allRadio.count() === 0) {
-        log.warning(
-            `The "${heading}" column has no default radio to select.`,
+        throw new Error(
+            `The "${heading}" column has no `
+            + `"${inputName}" default radio to select.`,
         );
-
-        return false;
     }
 
     const changed = await setControl(allRadio, true);
@@ -490,7 +530,11 @@ async function selectAllRadio(page, className, heading, inputName) {
  * all days.
  */
 async function clearDayOfWeek(page) {
-    const section = filterSection(page, 'day-of-week', 'Day of the Week');
+    const section = await requireSection(
+        page,
+        'day-of-week',
+        'Day of the Week',
+    );
 
     const checkboxes = section.locator('input[type="checkbox"]');
     const total = await checkboxes.count();
@@ -520,18 +564,16 @@ async function clearDayOfWeek(page) {
  * Class. A selected root renders the ico-f-checked-filled glyph.
  */
 async function selectAllTreeNodes(page, className, heading) {
-    const section = filterSection(page, className, heading);
+    const section = await requireSection(page, className, heading);
 
     const rootNode = section
         .locator('.controls-tree span.fancytree-node')
         .first();
 
     if (await rootNode.count() === 0) {
-        log.warning(
+        throw new Error(
             `The "${heading}" column has no tree to select.`,
         );
-
-        return false;
     }
 
     const checkbox = rootNode
@@ -557,7 +599,12 @@ async function selectAllTreeNodes(page, className, heading) {
  * Apply the requested Inclusions and untick the rest.
  */
 async function applyInclusions(page, inclusions) {
-    const section = filterSection(page, 'inclusions', 'Inclusions');
+    const section = await requireSection(
+        page,
+        'inclusions',
+        'Inclusions',
+    );
+
     const requested = new Set(inclusions);
 
     let changed = false;
@@ -594,14 +641,40 @@ async function applyInclusions(page, inclusions) {
     return changed;
 }
 
+async function isApplyEnabled(applyButton) {
+    const classes = await applyButton.getAttribute('class') ?? '';
+
+    return !classes.includes('disabled');
+}
+
 /**
- * Commit the Filters panel. Revel disables Apply while the form
- * still matches the applied report, in which case the panel is just
- * closed again.
+ * Revel enables Apply from its own change handlers, which can land
+ * after our click has already returned. Poll instead of reading the
+ * class once, so a slow handler cannot make the run skip the click
+ * and silently report on the previous filters.
  */
-async function applyFilters(page) {
-    const applyButton = page
-        .locator('#form-filter .actions .button-update')
+async function waitForApplyEnabled(applyButton, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+        // eslint-disable-next-line no-await-in-loop
+        if (await isApplyEnabled(applyButton)) return true;
+
+        // eslint-disable-next-line no-await-in-loop
+        await applyButton.page().waitForTimeout(250);
+    }
+
+    return false;
+}
+
+/**
+ * Commit the Filters panel. Revel keeps Apply disabled while the
+ * form still matches the applied report, so a run that needed no
+ * changes closes the panel instead of clicking a dead button.
+ */
+async function applyFilters(page, expectChanges) {
+    const applyButton = filterForm(page)
+        .locator('.actions .button-update')
         .first();
 
     await applyButton.waitFor({
@@ -609,23 +682,31 @@ async function applyFilters(page) {
         timeout: 20_000,
     });
 
-    const buttonClass = await applyButton.getAttribute('class') ?? '';
+    const canApply = expectChanges
+        ? await waitForApplyEnabled(applyButton)
+        : await isApplyEnabled(applyButton);
 
-    if (buttonClass.includes('disabled')) {
-        log.info(
-            'Apply is disabled; the report already matches the '
-            + 'requested filters. Closing the Filters panel.',
-        );
-
-        await filtersToggle(page).click();
-    } else {
+    if (canApply) {
         log.info('Applying the Filters panel selections.');
 
         await applyButton.click();
+    } else {
+        if (expectChanges) {
+            log.warning(
+                'Filter selections changed but Revel left Apply '
+                + 'disabled. Closing the panel without applying.',
+            );
+        } else {
+            log.info(
+                'No filter changes were needed and Apply is '
+                + 'disabled. Closing the Filters panel.',
+            );
+        }
+
+        await filtersToggle(page).click();
     }
 
-    await page
-        .locator('#form-filter')
+    await filterForm(page)
         .waitFor({
             state: 'hidden',
             timeout: 30_000,
@@ -1426,42 +1507,45 @@ try {
 
             await saveScreenshot(page, 'REVEL_FILTERS_OPEN');
 
-            await selectAllRadio(
-                page,
-                'employees',
-                'Employees',
-                'employee',
-            );
+            const filterChanges = [
+                await selectAllRadio(
+                    page,
+                    'employees',
+                    'Employees',
+                    'employee',
+                ),
+                await clearDayOfWeek(page),
+                await selectAllRadio(
+                    page,
+                    'pos-stations',
+                    'Pos Stations',
+                    'posstation',
+                ),
+                await selectAllRadio(
+                    page,
+                    'dining-options',
+                    'Dining Options',
+                    'dining_option',
+                ),
+                await selectAllTreeNodes(
+                    page,
+                    'product-class',
+                    'Product Class',
+                ),
+                await applyInclusions(page, inclusions),
+            ];
 
-            await clearDayOfWeek(page);
-
-            await selectAllRadio(
-                page,
-                'pos-stations',
-                'Pos Stations',
-                'posstation',
-            );
-
-            await selectAllRadio(
-                page,
-                'dining-options',
-                'Dining Options',
-                'dining_option',
-            );
-
-            await selectAllTreeNodes(
-                page,
-                'product-class',
-                'Product Class',
-            );
-
-            await applyInclusions(page, inclusions);
+            const filtersChanged = filterChanges.some(Boolean);
 
             await saveScreenshot(page, 'REVEL_FILTERS_SELECTED');
 
-            await applyFilters(page);
+            await applyFilters(page, filtersChanged);
 
-            log.info('Filters applied.');
+            log.info(
+                filtersChanged
+                    ? 'Filters applied.'
+                    : 'Filters already matched the request.',
+            );
 
             await selectReportView(page, reportView);
 
