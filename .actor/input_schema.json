@@ -1,6 +1,6 @@
 {
     "$schema": "https://apify.com/schemas/v1/input.ide.json",
-    "title": "Layne's Revel Hourly Sales",
+    "title": "Layne's Revel Hourly Salez",
     "description": "Credentials and report settings for the Layne's Revel Hourly Sales report.",
     "type": "object",
     "schemaVersion": 1,
