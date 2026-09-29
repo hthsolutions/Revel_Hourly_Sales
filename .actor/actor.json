@@ -1,8 +1,8 @@
 {
     "actorSpecification": 1,
-    "name": "laynes-revel-report-exporter",
-    "title": "Layne's Revel Report Exporter",
-    "description": "Logs into the Layne's Revel portal, runs configured reports for selected locations and business dates, and exports the results.",
+    "name": "laynes-revel-hourly-sales",
+    "title": "Layne's Revel Hourly Sales",
+    "description": "Logs into the Layne's Revel portal, runs the Hourly Sales report in 15-minute intervals for a start and end date, and exports one row per interval.",
     "version": "0.1",
     "buildTag": "latest",
     "dockerfile": "../Dockerfile",

@@ -14,22 +14,68 @@ const supabaseUrl =
 const supabaseServiceRoleKey =
     process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!supabaseServiceRoleKey) {
-    throw new Error(
-        'SUPABASE_SERVICE_ROLE_KEY is not configured.',
-    );
-}
-
-const supabase = createClient(
-    supabaseUrl,
-    supabaseServiceRoleKey,
-    {
-        auth: {
-            persistSession: false,
-            autoRefreshToken: false,
+const supabase = supabaseServiceRoleKey
+    ? createClient(
+        supabaseUrl,
+        supabaseServiceRoleKey,
+        {
+            auth: {
+                persistSession: false,
+                autoRefreshToken: false,
+            },
         },
-    },
-);
+    )
+    : null;
+
+const CENTRAL_TIME_ZONE = 'America/Chicago';
+
+/**
+ * Establishment codes prefix the names in Revel's location tree,
+ * for example "42 | Leander".
+ */
+const ESTABLISHMENT_CODES = {
+    Lampasas: '41',
+    Leander: '42',
+    'Marble Falls': '29',
+};
+
+/**
+ * Options offered by the report's aggregation dropdown.
+ */
+const REPORT_VIEWS = ['Hourly', '15 Min', 'Grouped'];
+
+/**
+ * Inclusion keys accepted by the Actor input mapped to the label
+ * text Revel renders next to each Inclusions checkbox. Labels are
+ * matched as a case-insensitive substring so Revel can extend the
+ * wording without breaking the run.
+ */
+const INCLUSION_LABELS = {
+    open: 'Open',
+    unpaid: 'Unpaid',
+    irregular: 'Irregular',
+    discounts: 'Discounts',
+    service_fees: 'Service Fee',
+    taxes: 'Taxes',
+    web_orders: 'Web Orders',
+    dining_options: 'Dining Opt',
+};
+
+/**
+ * Report columns mapped to the header spellings Revel has used in
+ * its Hourly Sales export. Matching is case-insensitive.
+ */
+const COLUMN_ALIASES = {
+    transactions: ['# transactions', 'transactions'],
+    items: ['# items', 'items'],
+    avg_sales_per_check: [
+        'avg. sales/check',
+        'avg sales/check',
+        'average sales/check',
+    ],
+    sales: ['sales', 'net sales'],
+    sales_percent: ['% sales', 'sales %', '% of sales'],
+};
 
 /**
  * Capture a screenshot and save it in the run's
@@ -70,7 +116,17 @@ function validateTime(value, fieldName) {
     }
 }
 
-const CENTRAL_TIME_ZONE = 'America/Chicago';
+function normalizeMeridiem(value, fieldName) {
+    const meridiem = String(value ?? '').trim().toUpperCase();
+
+    if (meridiem !== 'AM' && meridiem !== 'PM') {
+        throw new Error(
+            `${fieldName} must be AM or PM. Received: ${value}`,
+        );
+    }
+
+    return meridiem;
+}
 
 /**
  * Calendar date for a moment in US Central Time.
@@ -104,9 +160,10 @@ function formatDateParts({ year, month, day }) {
 }
 
 /**
- * Report start date: yesterday in US Central Time, MM/DD/YYYY.
+ * Yesterday in US Central Time, MM/DD/YYYY. Hourly Sales defaults
+ * to a single completed business day.
  */
-function calculateStartDate(today = new Date()) {
+function calculateDefaultDate(today = new Date()) {
     const { year, month, day } = getCentralDateParts(today);
     const calendarDate = new Date(Date.UTC(year, month - 1, day));
 
@@ -120,74 +177,596 @@ function calculateStartDate(today = new Date()) {
 }
 
 /**
- * Report end date: today in US Central Time, MM/DD/YYYY.
+ * Convert MM/DD/YYYY into YYYY-MM-DD.
  */
-function calculateEndDate(today = new Date()) {
-    return formatDateParts(getCentralDateParts(today));
+function toIsoDate(value) {
+    const [month, day, year] = value.split('/');
+
+    return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
 }
 
 /**
- * Convert each worksheet into a nested dictionary by mapping
- * row 1 headers to row 2 values. Row 3 contains report totals
- * and is intentionally ignored for a single-period export.
+ * Turn Revel's display values ("$1,234.56", "12%", "-") into
+ * numbers. Anything that is not numeric becomes null.
  */
-function workbookToNestedDictionary(workbook) {
-    const sheets = {};
+function toNumber(value) {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : null;
+    }
 
-    for (const sheetName of workbook.SheetNames) {
-        const worksheet = workbook.Sheets[sheetName];
+    if (value === null || value === undefined) return null;
 
-        const rows = XLSX.utils.sheet_to_json(worksheet, {
-            header: 1,
-            defval: null,
-            raw: true,
-        });
+    const text = String(value).replace(/[$%,\s]/g, '');
 
-        const headers = rows[0] ?? [];
-        const values = rows[1] ?? [];
+    if (text === '' || text === '-') return null;
 
-        if (headers.length === 0) {
-            throw new Error(
-                `Worksheet "${sheetName}" does not contain headers.`,
-            );
+    const parsed = Number(text);
+
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Split "06:00 AM - 06:14 AM" into 24-hour start and end times.
+ * Returns null for rows that are not intervals, such as totals.
+ */
+function parseIntervalLabel(label) {
+    const match = String(label ?? '').match(
+        /(\d{1,2}):(\d{2})\s*(AM|PM)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i,
+    );
+
+    if (!match) return null;
+
+    const to24Hour = (hour, minute, meridiem) => {
+        const base = Number(hour) % 12;
+        const shifted = meridiem.toUpperCase() === 'PM'
+            ? base + 12
+            : base;
+
+        return `${String(shifted).padStart(2, '0')}:${minute}`;
+    };
+
+    return {
+        start: to24Hour(match[1], match[2], match[3]),
+        end: to24Hour(match[4], match[5], match[6]),
+    };
+}
+
+function findColumnValue(record, aliases) {
+    const entry = Object.entries(record).find(
+        ([header]) => aliases.includes(
+            String(header).trim().toLowerCase(),
+        ),
+    );
+
+    return entry ? entry[1] : null;
+}
+
+/**
+ * Read a worksheet as a header row plus one record per data row.
+ * Blank leading headers become positional names so the interval
+ * column, which Revel exports unlabelled, still has a key.
+ */
+function worksheetToRecords(worksheet) {
+    const grid = XLSX.utils.sheet_to_json(worksheet, {
+        header: 1,
+        defval: null,
+        raw: true,
+        blankrows: false,
+    });
+
+    if (grid.length < 2) {
+        return { headers: [], records: [] };
+    }
+
+    const headers = (grid[0] ?? []).map((header, index) => {
+        const text = header === null || header === undefined
+            ? ''
+            : String(header).trim();
+
+        if (text !== '') return text;
+
+        return index === 0 ? 'Interval' : `Column ${index + 1}`;
+    });
+
+    const records = grid
+        .slice(1)
+        .filter((row) => row.some(
+            (cell) => cell !== null && String(cell).trim() !== '',
+        ))
+        .map((row) => Object.fromEntries(
+            headers.map((header, index) => [
+                header,
+                row[index] ?? null,
+            ]),
+        ));
+
+    return { headers, records };
+}
+
+/**
+ * Flatten every worksheet of the export into dataset rows keyed by
+ * establishment, business date and interval.
+ */
+function buildIntervalRows({
+    sheets,
+    location,
+    businessDate,
+    reportView,
+}) {
+    const rows = [];
+
+    for (const [sheetName, { headers, records }] of Object.entries(sheets)) {
+        const intervalHeader = headers[0];
+
+        for (const record of records) {
+            const intervalLabel = intervalHeader
+                ? String(record[intervalHeader] ?? '').trim()
+                : '';
+
+            const interval = parseIntervalLabel(intervalLabel);
+
+            rows.push({
+                id: `${businessDate}_${location}_${sheetName}`
+                    + `_${intervalLabel || 'total'}`,
+                location,
+                business_date: businessDate,
+                report_view: reportView,
+                revenue_center: sheetName,
+
+                interval_label: intervalLabel,
+                interval_start: interval?.start ?? null,
+                interval_end: interval?.end ?? null,
+                is_total: interval === null,
+
+                transactions: toNumber(
+                    findColumnValue(record, COLUMN_ALIASES.transactions),
+                ),
+                items: toNumber(
+                    findColumnValue(record, COLUMN_ALIASES.items),
+                ),
+                avg_sales_per_check: toNumber(
+                    findColumnValue(
+                        record,
+                        COLUMN_ALIASES.avg_sales_per_check,
+                    ),
+                ),
+                sales: toNumber(
+                    findColumnValue(record, COLUMN_ALIASES.sales),
+                ),
+                sales_percent: toNumber(
+                    findColumnValue(record, COLUMN_ALIASES.sales_percent),
+                ),
+
+                // Preserve every column from the source report.
+                raw_data: record,
+
+                extracted_at: new Date().toISOString(),
+            });
         }
+    }
 
-        if (values.length === 0) {
-            throw new Error(
-                `Worksheet "${sheetName}" does not contain report values.`,
-            );
-        }
+    return rows;
+}
 
-        const duplicateHeaders = headers.filter(
-            (header, index) => (
-                header !== null
-                && header !== undefined
-                && headers.indexOf(header) !== index
-            ),
+/**
+ * Wait until Revel has no visible loading indicator left inside the
+ * report area. Hidden loaders stay in the DOM permanently, so this
+ * checks visibility instead of waiting for detachment.
+ */
+async function waitForReportToSettle(page) {
+    await page.waitForFunction(
+        () => {
+            const reportArea =
+                document.querySelector('.report-content')
+                ?? document.querySelector('.report-container')
+                ?? document.querySelector('.reports-content')
+                ?? document.body;
+
+            const loadingElements = reportArea.querySelectorAll([
+                '.loading',
+                '.loader',
+                '.spinner',
+                '.loading-mask',
+                '.blockUI',
+                '.fa-spinner',
+                '.icon-spinner',
+                '[class*="loading-indicator"]',
+            ].join(','));
+
+            return [...loadingElements].every((element) => {
+                const style = window.getComputedStyle(element);
+                const bounds = element.getBoundingClientRect();
+
+                return (
+                    style.display === 'none'
+                    || style.visibility === 'hidden'
+                    || style.opacity === '0'
+                    || bounds.width === 0
+                    || bounds.height === 0
+                );
+            });
+        },
+        undefined,
+        {
+            timeout: 90_000,
+            polling: 500,
+        },
+    );
+
+    /*
+     * Give computed totals and charts a brief opportunity to settle
+     * after the loading indicator disappears.
+     */
+    await page.waitForTimeout(1_500);
+}
+
+/**
+ * Locate one column of the Filters panel. Revel gives each column a
+ * class, and the heading text is the fallback when a class differs
+ * between report types.
+ */
+function filterSection(page, className, heading) {
+    return page
+        .locator(
+            `#form-filter li.${className}, `
+            + `#form-filter li:has(> div.heading:text-is("${heading}"))`,
+        )
+        .first();
+}
+
+function filtersToggle(page) {
+    return page
+        .getByText('Filters', { exact: true })
+        .locator('visible=true')
+        .first();
+}
+
+async function openFilterPanel(page) {
+    const panel = page.locator('#form-filter');
+
+    if (await panel.isVisible().catch(() => false)) return;
+
+    const toggle = filtersToggle(page);
+
+    await toggle.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    await toggle.click();
+
+    await panel.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+}
+
+/**
+ * Revel hides the native inputs and styles a sibling span, so the
+ * label is the clickable surface.
+ */
+async function setControl(inputLocator, shouldBeChecked) {
+    const isChecked = await inputLocator.isChecked();
+
+    if (isChecked === shouldBeChecked) return false;
+
+    await inputLocator
+        .locator('xpath=ancestor::label[1]')
+        .click();
+
+    return true;
+}
+
+/**
+ * Select the "All (Default)" radio of a Filters column.
+ */
+async function selectAllRadio(page, className, heading, inputName) {
+    const section = filterSection(page, className, heading);
+
+    const allRadio = section
+        .locator(`input[type="radio"][name="${inputName}"][value=""]`)
+        .first();
+
+    if (await allRadio.count() === 0) {
+        log.warning(
+            `The "${heading}" column has no default radio to select.`,
         );
 
-        if (duplicateHeaders.length > 0) {
-            throw new Error(
-                `Worksheet "${sheetName}" contains duplicate headers: `
-                + `${[...new Set(duplicateHeaders)].join(', ')}`,
-            );
+        return false;
+    }
+
+    const changed = await setControl(allRadio, true);
+
+    log.info(
+        `"${heading}" set to All (Default).`
+        + `${changed ? ' Selection changed.' : ''}`,
+    );
+
+    return changed;
+}
+
+/**
+ * Clear every Day of the Week checkbox, which makes Revel report on
+ * all days.
+ */
+async function clearDayOfWeek(page) {
+    const section = filterSection(page, 'day-of-week', 'Day of the Week');
+
+    const checkboxes = section.locator('input[type="checkbox"]');
+    const total = await checkboxes.count();
+
+    let changed = false;
+
+    for (let index = 0; index < total; index += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const didChange = await setControl(
+            checkboxes.nth(index),
+            false,
+        );
+
+        changed = changed || didChange;
+    }
+
+    log.info(
+        `"Day of the Week" cleared (${total} checkboxes).`
+        + `${changed ? ' Selection changed.' : ''}`,
+    );
+
+    return changed;
+}
+
+/**
+ * Tick the "All" root node of a Fancytree column such as Product
+ * Class. A selected root renders the ico-f-checked-filled glyph.
+ */
+async function selectAllTreeNodes(page, className, heading) {
+    const section = filterSection(page, className, heading);
+
+    const rootNode = section
+        .locator('.controls-tree span.fancytree-node')
+        .first();
+
+    if (await rootNode.count() === 0) {
+        log.warning(
+            `The "${heading}" column has no tree to select.`,
+        );
+
+        return false;
+    }
+
+    const checkbox = rootNode
+        .locator('span.fancytree-checkbox')
+        .first();
+
+    const glyph = await checkbox.getAttribute('class') ?? '';
+
+    if (glyph.includes('ico-f-checked-filled')) {
+        log.info(`"${heading}" already has All selected.`);
+
+        return false;
+    }
+
+    await checkbox.click();
+
+    log.info(`"${heading}" set to All.`);
+
+    return true;
+}
+
+/**
+ * Apply the requested Inclusions and untick the rest.
+ */
+async function applyInclusions(page, inclusions) {
+    const section = filterSection(page, 'inclusions', 'Inclusions');
+    const requested = new Set(inclusions);
+
+    let changed = false;
+
+    for (const [key, label] of Object.entries(INCLUSION_LABELS)) {
+        const checkbox = section
+            .locator('label')
+            .filter({ hasText: label })
+            .first()
+            .locator('input[type="checkbox"]');
+
+        // eslint-disable-next-line no-await-in-loop
+        if (await checkbox.count() === 0) {
+            log.warning(`Inclusion "${label}" was not found.`);
+
+            // eslint-disable-next-line no-continue
+            continue;
         }
 
-        sheets[sheetName] = Object.fromEntries(
-            headers
-                .map((header, index) => [
-                    header,
-                    values[index] ?? null,
-                ])
-                .filter(([header]) => (
-                    header !== null
-                    && header !== undefined
-                    && String(header).trim() !== ''
-                )),
+        // eslint-disable-next-line no-await-in-loop
+        const didChange = await setControl(
+            checkbox,
+            requested.has(key),
+        );
+
+        changed = changed || didChange;
+    }
+
+    log.info(
+        `Inclusions set to: ${inclusions.join(', ') || 'none'}.`
+        + `${changed ? ' Selection changed.' : ''}`,
+    );
+
+    return changed;
+}
+
+/**
+ * Commit the Filters panel. Revel disables Apply while the form
+ * still matches the applied report, in which case the panel is just
+ * closed again.
+ */
+async function applyFilters(page) {
+    const applyButton = page
+        .locator('#form-filter .actions .button-update')
+        .first();
+
+    await applyButton.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    const buttonClass = await applyButton.getAttribute('class') ?? '';
+
+    if (buttonClass.includes('disabled')) {
+        log.info(
+            'Apply is disabled; the report already matches the '
+            + 'requested filters. Closing the Filters panel.',
+        );
+
+        await filtersToggle(page).click();
+    } else {
+        log.info('Applying the Filters panel selections.');
+
+        await applyButton.click();
+    }
+
+    await page
+        .locator('#form-filter')
+        .waitFor({
+            state: 'hidden',
+            timeout: 30_000,
+        })
+        .catch(() => {
+            log.warning(
+                'The Filters panel stayed open after Apply.',
+            );
+        });
+
+    await waitForReportToSettle(page);
+}
+
+/**
+ * Switch the report's aggregation dropdown. Revel renders it with
+ * Select2 v3, so the native select is offscreen and the visible
+ * control is an anchor that opens #select2-drop.
+ */
+async function selectReportView(page, viewLabel) {
+    /*
+     * Revel labels the control with the active aggregation, for
+     * example "Hourly View" or "15 Min View". Matching on "View"
+     * keeps this away from the Select2 widgets inside Filters.
+     */
+    const chosen = page
+        .locator('.select2-container a.select2-choice:visible')
+        .filter({ hasText: /view/i })
+        .first();
+
+    await chosen.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    const currentLabel = (await chosen.innerText()).trim();
+
+    if (currentLabel.toLowerCase().startsWith(viewLabel.toLowerCase())) {
+        log.info(`Report view is already "${currentLabel}".`);
+
+        return;
+    }
+
+    log.info(
+        `Switching the report view from "${currentLabel}" `
+        + `to "${viewLabel}".`,
+    );
+
+    await chosen.click();
+
+    const dropdown = page.locator('#select2-drop');
+
+    await dropdown.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    const option = dropdown
+        .locator('.select2-result-label')
+        .filter({
+            hasText: new RegExp(`^\\s*${viewLabel}\\s*$`, 'i'),
+        })
+        .first();
+
+    await option.waitFor({
+        state: 'visible',
+        timeout: 20_000,
+    });
+
+    await option.click();
+
+    await dropdown.waitFor({
+        state: 'hidden',
+        timeout: 20_000,
+    });
+
+    await waitForReportToSettle(page);
+}
+
+/**
+ * Confirm the rendered table really uses 15-minute buckets. Hourly
+ * rows always end at :59, so a row ending at :14, :29 or :44 is the
+ * distinguishing signal.
+ */
+async function waitForQuarterHourRows(page) {
+    await page.waitForFunction(
+        () => /\d{1,2}:(14|29|44)\s*(AM|PM)/i.test(
+            document.body.innerText,
+        ),
+        undefined,
+        {
+            timeout: 60_000,
+            polling: 500,
+        },
+    );
+}
+
+/**
+ * Read the rendered report table. Used when the Excel export is
+ * unavailable so a run still produces data.
+ */
+async function scrapeReportTable(page) {
+    const table = await page.evaluate(() => {
+        const cleanup = (value) => (value ?? '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const element = [...document.querySelectorAll('table')]
+            .find((candidate) => candidate.querySelectorAll('tr').length > 2);
+
+        if (!element) return null;
+
+        const rows = [...element.querySelectorAll('tr')]
+            .map((row) => [...row.querySelectorAll('th, td')]
+                .map((cell) => cleanup(cell.textContent)));
+
+        return rows.filter((row) => row.length > 0);
+    });
+
+    if (!table || table.length < 2) {
+        throw new Error(
+            'Unable to read the rendered Hourly Sales table.',
         );
     }
 
-    return sheets;
+    const headers = table[0].map((header, index) => {
+        if (header !== '') return header;
+
+        return index === 0 ? 'Interval' : `Column ${index + 1}`;
+    });
+
+    const records = table
+        .slice(1)
+        .filter((row) => row.some((cell) => cell !== ''))
+        .map((row) => Object.fromEntries(
+            headers.map((header, index) => [
+                header,
+                row[index] ?? null,
+            ]),
+        ));
+
+    return { 'Rendered table': { headers, records } };
 }
 
 let exitCode = 0;
@@ -199,71 +778,68 @@ try {
     const input = await Actor.getInput();
 
     const {
-        url = 'https://laynes.revelup.com/reports/sales_summary/',
+        url = 'https://laynes.revelup.com/reports/hourly_sales/',
         username,
         password,
         establishment = 'Leander',
-        override_flag = false,
-        override_startDate,
-        override_endDate,
-        startTime,
-        startMeridiem,
-        endTime,
-        endMeridiem,
+        override_flag: overrideFlag = false,
+        override_startDate: overrideStartDate,
+        override_endDate: overrideEndDate,
+        startTime = '12:00',
+        startMeridiem = 'AM',
+        endTime = '11:59',
+        endMeridiem = 'PM',
+        reportView = '15 Min',
+        inclusions = ['discounts'],
+        supabaseTable = '',
     } = input ?? {};
 
     let startDate;
     let endDate;
 
-    if (override_flag) {
-        if (!override_startDate || !override_endDate) {
+    if (overrideFlag) {
+        if (!overrideStartDate || !overrideEndDate) {
             throw new Error(
                 'override_startDate and override_endDate are required '
                 + 'when override_flag is true.',
             );
         }
 
-        startDate = override_startDate;
-        endDate = override_endDate;
+        startDate = overrideStartDate;
+        endDate = overrideEndDate;
     } else {
-        const today = new Date();
+        const defaultDate = calculateDefaultDate();
 
-        startDate = calculateStartDate(today);
-        endDate = calculateEndDate(today);
+        startDate = defaultDate;
+        endDate = defaultDate;
     }
 
     log.info('Actor input loaded.', {
         hasUsername: Boolean(username),
         hasPassword: Boolean(password),
         establishment,
-        override_flag,
+        override_flag: overrideFlag,
         startDate,
         startTime,
         startMeridiem,
         endDate,
         endTime,
         endMeridiem,
+        reportView,
+        inclusions,
+        supabaseTable: supabaseTable || '(disabled)',
     });
 
     if (!username || !password) {
         throw new Error('Both username and password are required.');
     }
 
-    if (
-        !startTime
-        || !startMeridiem
-        || !endTime
-        || !endMeridiem
-    ) {
-        throw new Error(
-            'Start and end times and AM/PM values are required.',
-        );
-    }
+    const establishmentCode = ESTABLISHMENT_CODES[establishment];
 
-    if (establishment !== 'Leander') {
+    if (!establishmentCode) {
         throw new Error(
-            `The current Actor version only supports Leander. `
-            + `Received: ${establishment}`,
+            `Unknown establishment: ${establishment}. `
+            + `Supported: ${Object.keys(ESTABLISHMENT_CODES).join(', ')}`,
         );
     }
 
@@ -272,27 +848,61 @@ try {
     validateTime(startTime, 'startTime');
     validateTime(endTime, 'endTime');
 
-    const normalizedStartMeridiem =
-        startMeridiem.trim().toUpperCase();
+    const normalizedStartMeridiem = normalizeMeridiem(
+        startMeridiem,
+        'startMeridiem',
+    );
 
-    const normalizedEndMeridiem =
-        endMeridiem.trim().toUpperCase();
+    const normalizedEndMeridiem = normalizeMeridiem(
+        endMeridiem,
+        'endMeridiem',
+    );
 
-    if (
-        normalizedStartMeridiem !== 'AM'
-        || normalizedEndMeridiem !== 'AM'
-    ) {
+    if (!REPORT_VIEWS.includes(reportView)) {
         throw new Error(
-            'The current Actor version supports AM report times only.',
+            `Unknown reportView: ${reportView}. `
+            + `Supported: ${REPORT_VIEWS.join(', ')}`,
         );
     }
 
-    const targetEstablishment = 'Leander';
+    if (!Array.isArray(inclusions)) {
+        throw new Error(
+            'inclusions must be an array of inclusion keys.',
+        );
+    }
+
+    const unknownInclusions = inclusions.filter(
+        (key) => !(key in INCLUSION_LABELS),
+    );
+
+    if (unknownInclusions.length > 0) {
+        throw new Error(
+            `Unknown inclusions: ${unknownInclusions.join(', ')}`,
+        );
+    }
+
+    if (supabaseTable && !supabase) {
+        throw new Error(
+            'supabaseTable is set but SUPABASE_SERVICE_ROLE_KEY is '
+            + 'not configured.',
+        );
+    }
+
+    const targetEstablishment = establishment;
+    const establishmentTitle = `${establishmentCode} | ${establishment}`;
+    const reportPath = new URL(url).pathname;
+
+    /*
+     * Crawlee swallows request errors once failedRequestHandler has
+     * run, so the failure is re-raised after crawler.run() to keep
+     * the Actor's exit code meaningful.
+     */
+    let requestFailure = null;
 
     const crawler = new PlaywrightCrawler({
         maxRequestsPerCrawl: 1,
         maxRequestRetries: 0,
-        requestHandlerTimeoutSecs: 240,
+        requestHandlerTimeoutSecs: 420,
 
         async requestHandler({ page, request }) {
             log.info(`Opening Revel portal: ${request.url}`);
@@ -367,7 +977,7 @@ try {
 
             log.info(`Login completed. Current URL: ${page.url()}`);
 
-            if (!page.url().includes('/reports/sales_summary')) {
+            if (!page.url().includes(reportPath)) {
                 log.info(`Navigating to report URL: ${url}`);
 
                 await page.goto(url, {
@@ -399,13 +1009,14 @@ try {
 
                 log.info('Clicked the establishment name.');
 
-                const leanderOption = page
+                const establishmentOption = page
                     .locator('span.fancytree-title')
                     .filter({
-                        hasText: '42 | Leander',
-                    });
+                        hasText: establishmentTitle,
+                    })
+                    .first();
 
-                await leanderOption.waitFor({
+                await establishmentOption.waitFor({
                     state: 'visible',
                     timeout: 30_000,
                 });
@@ -421,14 +1032,17 @@ try {
                     `Selecting establishment: ${targetEstablishment}`,
                 );
 
-                await leanderOption.click();
+                await establishmentOption.click();
             }
 
             const selectedHeader = page
                 .locator('[data-cy="header-establishment-text"]')
                 .filter({
-                    hasText: /^\s*Leander\s*$/,
-                });
+                    hasText: new RegExp(
+                        `^\\s*${targetEstablishment}\\s*$`,
+                    ),
+                })
+                .first();
 
             await selectedHeader.waitFor({
                 state: 'visible',
@@ -450,37 +1064,36 @@ try {
                 + `${selectedEstablishment}`,
             );
 
-            const salesSummaryHeading = page.getByRole('heading', {
-                name: 'Sales Summary',
-                exact: true,
-            });
+            const reportDateRow = page
+                .locator('.report-date-row')
+                .first();
 
-            await salesSummaryHeading.waitFor({
+            await reportDateRow.waitFor({
                 state: 'visible',
                 timeout: 30_000,
             });
 
             await saveScreenshot(
                 page,
-                'REVEL_LEANDER_SALES_SUMMARY',
+                'REVEL_HOURLY_SALES_LOADED',
             );
 
-            const dateRangeDropdown = page.locator(
-                '.report-date-row .ico-f-to-down',
-            );
+            const dateRangeDropdown = page
+                .locator('.report-date-row .ico-f-to-down')
+                .first();
 
             await dateRangeDropdown.waitFor({
                 state: 'visible',
                 timeout: 20_000,
             });
 
-            log.info('Opening the Sales Summary date-range dropdown.');
+            log.info('Opening the Hourly Sales date-range dropdown.');
 
             await dateRangeDropdown.click();
 
-            const visibleDatePicker = page.locator(
-                '.daterangepicker:visible',
-            );
+            const visibleDatePicker = page
+                .locator('.daterangepicker:visible')
+                .first();
 
             await visibleDatePicker.waitFor({
                 state: 'visible',
@@ -759,14 +1372,14 @@ try {
                             + `${day.padStart(2, '0')}/${year}`;
                     };
 
-                    const reportDateRow = document.querySelector(
+                    const dateRow = document.querySelector(
                         '.report-date-row',
                     );
 
-                    if (!reportDateRow) return false;
+                    if (!dateRow) return false;
 
                     const displayedDates = (
-                        reportDateRow.textContent ?? ''
+                        dateRow.textContent ?? ''
                     )
                         .match(/\d{1,2}\/\d{1,2}\/\d{4}/g)
                         ?.map(normalizeDate);
@@ -793,7 +1406,7 @@ try {
             );
 
             const displayedRange = (
-                await page.locator('.report-date-row').innerText()
+                await reportDateRow.innerText()
             ).replace(/\s+/g, ' ').trim();
 
             log.info(
@@ -801,346 +1414,233 @@ try {
                 + `${displayedRange}`,
             );
 
-            /*
-             * Hidden loaders can remain in Revel's DOM permanently. Check
-             * whether any matching loader is actually visible instead of
-             * waiting for the elements to be detached.
-             */
-            await page.waitForFunction(
-                () => {
-                    const reportArea =
-                        document.querySelector('.report-content')
-                        ?? document.querySelector('.report-container')
-                        ?? document.querySelector('.reports-content')
-                        ?? document.body;
-
-                    const loadingElements = reportArea.querySelectorAll([
-                        '.loading',
-                        '.loader',
-                        '.spinner',
-                        '.loading-mask',
-                        '.blockUI',
-                        '.fa-spinner',
-                        '.icon-spinner',
-                        '[class*="loading-indicator"]',
-                    ].join(','));
-
-                    return [...loadingElements].every((element) => {
-                        const style = window.getComputedStyle(element);
-                        const bounds = element.getBoundingClientRect();
-
-                        return (
-                            style.display === 'none'
-                            || style.visibility === 'hidden'
-                            || style.opacity === '0'
-                            || bounds.width === 0
-                            || bounds.height === 0
-                        );
-                    });
-                },
-                undefined,
-                {
-                    timeout: 90_000,
-                    polling: 500,
-                },
-            );
+            await waitForReportToSettle(page);
 
             /*
-             * Give computed totals and charts a brief opportunity to settle
-             * after the loading indicator disappears.
+             * Filters panel: everything stays on its "All" default
+             * except the Inclusions checkboxes.
              */
-            await page.waitForTimeout(1_500);
+            log.info('Opening the Filters panel.');
 
-            await saveScreenshot(
+            await openFilterPanel(page);
+
+            await saveScreenshot(page, 'REVEL_FILTERS_OPEN');
+
+            await selectAllRadio(
                 page,
-                'REVEL_SALES_SUMMARY_APPLIED',
+                'employees',
+                'Employees',
+                'employee',
             );
+
+            await clearDayOfWeek(page);
+
+            await selectAllRadio(
+                page,
+                'pos-stations',
+                'Pos Stations',
+                'posstation',
+            );
+
+            await selectAllRadio(
+                page,
+                'dining-options',
+                'Dining Options',
+                'dining_option',
+            );
+
+            await selectAllTreeNodes(
+                page,
+                'product-class',
+                'Product Class',
+            );
+
+            await applyInclusions(page, inclusions);
+
+            await saveScreenshot(page, 'REVEL_FILTERS_SELECTED');
+
+            await applyFilters(page);
+
+            log.info('Filters applied.');
+
+            await selectReportView(page, reportView);
+
+            if (reportView === '15 Min') {
+                await waitForQuarterHourRows(page);
+            }
+
+            await saveScreenshot(page, 'REVEL_REPORT_READY');
 
             log.info(
-                'Sales Summary refreshed for the requested date range.',
+                `Hourly Sales is ready in the "${reportView}" view.`,
             );
 
             /*
-             * Open the three-dot export menu.
+             * Prefer the Excel export: it carries the same columns as
+             * the table without the rendering truncation.
              */
-            const exportMenuButton = page
-                .locator('.header-more .button-more:visible')
-                .first();
+            let sheets;
+            let source;
+            let sourceSizeBytes = null;
+            let sheetNames = [];
 
-            await exportMenuButton.waitFor({
-                state: 'visible',
-                timeout: 20_000,
-            });
+            try {
+                const exportMenuButton = page
+                    .locator('.header-more .button-more:visible')
+                    .first();
 
-            log.info('Opening the report export menu.');
+                await exportMenuButton.waitFor({
+                    state: 'visible',
+                    timeout: 20_000,
+                });
 
-            await exportMenuButton.click();
+                log.info('Opening the report export menu.');
 
-            /*
-             * Select the Excel export option.
-             */
-            const excelExportLink = page
-                .locator('[data-exporttype="excel"]:visible')
-                .first();
+                await exportMenuButton.click();
 
-            await excelExportLink.waitFor({
-                state: 'visible',
-                timeout: 20_000,
-            });
+                const excelExportLink = page
+                    .locator('[data-exporttype="excel"]:visible')
+                    .first();
 
-            await saveScreenshot(
-                page,
-                'REVEL_EXPORT_MENU_OPEN',
-            );
+                await excelExportLink.waitFor({
+                    state: 'visible',
+                    timeout: 20_000,
+                });
 
-            log.info('Downloading the Sales Summary Excel report.');
+                await saveScreenshot(page, 'REVEL_EXPORT_MENU_OPEN');
 
-            const downloadPromise = page.waitForEvent(
-                'download',
-                {
+                log.info('Downloading the Hourly Sales Excel report.');
+
+                const downloadPromise = page.waitForEvent('download', {
                     timeout: 60_000,
-                },
-            );
+                });
 
-            await excelExportLink.click();
+                await excelExportLink.click();
 
-            const download = await downloadPromise;
+                const download = await downloadPromise;
+                const downloadFailure = await download.failure();
 
-            const downloadFailure = await download.failure();
+                if (downloadFailure) {
+                    throw new Error(
+                        `Excel download failed: ${downloadFailure}`,
+                    );
+                }
 
-            if (downloadFailure) {
-                throw new Error(
-                    `Excel download failed: ${downloadFailure}`,
+                const temporaryFilePath = await download.path();
+
+                if (!temporaryFilePath) {
+                    throw new Error(
+                        'Playwright did not provide a path '
+                        + 'for the downloaded file.',
+                    );
+                }
+
+                const excelBuffer = await readFile(temporaryFilePath);
+
+                const workbook = XLSX.read(excelBuffer, {
+                    type: 'buffer',
+                    cellDates: false,
+                });
+
+                sheets = Object.fromEntries(
+                    workbook.SheetNames.map((sheetName) => [
+                        sheetName,
+                        worksheetToRecords(workbook.Sheets[sheetName]),
+                    ]),
                 );
+
+                source = 'excel-export';
+                sourceSizeBytes = excelBuffer.length;
+                sheetNames = workbook.SheetNames;
+            } catch (exportError) {
+                log.warning(
+                    `Excel export unavailable, falling back to the `
+                    + `rendered table: ${exportError.message}`,
+                );
+
+                sheets = await scrapeReportTable(page);
+                source = 'rendered-table';
+                sheetNames = Object.keys(sheets);
             }
 
-            const temporaryFilePath = await download.path();
+            const businessDate = toIsoDate(startDate);
 
-            if (!temporaryFilePath) {
-                throw new Error(
-                    'Playwright did not provide a path '
-                    + 'for the downloaded file.',
-                );
-            }
-
-            const excelBuffer = await readFile(
-                temporaryFilePath,
-            );
-
-            /*
-             * Parse the downloaded Excel workbook directly from
-             * memory and map every sheet's row 1 headers to its
-             * row 2 values.
-             */
-            const workbook = XLSX.read(excelBuffer, {
-                type: 'buffer',
-                cellDates: false,
+            const intervalRows = buildIntervalRows({
+                sheets,
+                location: selectedEstablishment,
+                businessDate,
+                reportView,
             });
 
-            const sheets = workbookToNestedDictionary(workbook);
-
-            const fieldCountBySheet = Object.fromEntries(
-                Object.entries(sheets).map(
-                    ([sheetName, fields]) => [
-                        sheetName,
-                        Object.keys(fields).length,
-                    ],
-                ),
-            );
-
-            const allRevenueCenters =
-                sheets['All revenue centers'];
-
-            if (!allRevenueCenters) {
+            if (intervalRows.length === 0) {
                 throw new Error(
-                    'The "All revenue centers" sheet was not found.',
+                    'The Hourly Sales report produced no rows.',
                 );
             }
 
-            const rawNetSales = allRevenueCenters['Net Sales'];
-
-            if (
-                rawNetSales === undefined
-                || rawNetSales === null
-                || rawNetSales === ''
-            ) {
-                throw new Error(
-                    'The "Net Sales" field was not found in '
-                    + 'the "All revenue centers" sheet.',
-                );
-            }
-
-            /*
-            * XLSX normally returns this as a number. This fallback also
-            * handles values formatted like "$5,350.50".
-            */
-            const netSales = typeof rawNetSales === 'number'
-                ? rawNetSales
-                : Number(
-                    String(rawNetSales).replace(/[$,\s]/g, ''),
-                );
-
-            if (!Number.isFinite(netSales)) {
-                throw new Error(
-                    `Net Sales is not numeric: ${rawNetSales}`,
-                );
-            }
-
-            /*
-            * Convert MM/DD/YYYY into YYYY-MM-DD.
-            * Example: 07/04/2026 becomes 2026-07-04.
-            */
-            const [startMonth, startDay, startYear] =
-                startDate.split('/');
-
-            const formattedStartDate =
-                `${startYear}-${startMonth.padStart(2, '0')}`
-                + `-${startDay.padStart(2, '0')}`;
-
-            const dailySalesRow = {
-                id: `${formattedStartDate}_${selectedEstablishment}`,
-                location: selectedEstablishment,
-                business_date: formattedStartDate,
-
-                time_from: allRevenueCenters['Time From'],
-                time_to: allRevenueCenters['Time To'],
-
-                taxable_sales: allRevenueCenters['Taxable Sales'],
-                total_product_sales:
-                    allRevenueCenters['Total Product Sales'],
-                gross_sales: allRevenueCenters['Gross Sales'],
-                net_sales: allRevenueCenters['Net Sales'],
-                total_payments: allRevenueCenters['Total Payments'],
-                net_account_for: allRevenueCenters['Net Account For'],
-
-                to_go: allRevenueCenters['To Go'],
-                to_go_percent: allRevenueCenters['To Go P'],
-                eat_in: allRevenueCenters['Eat In'],
-                eat_in_percent: allRevenueCenters['Eat In P'],
-                drive_through: allRevenueCenters['Drive Through'],
-                drive_through_percent:
-                    allRevenueCenters['Drive Through P'],
-                pickup: allRevenueCenters['Pickup'],
-                pickup_percent: allRevenueCenters['Pickup P'],
-                dd_marketplace: allRevenueCenters['DD Marketplace'],
-                dd_marketplace_percent:
-                    allRevenueCenters['DD Marketplace P'],
-                uber_eats: allRevenueCenters['Uber Eats'],
-                uber_eats_percent: allRevenueCenters['Uber Eats P'],
-
-                item_discounts: allRevenueCenters['Item Discounts'],
-                order_discounts_total:
-                    allRevenueCenters['Order Discounts Total'],
-                total_discounts: allRevenueCenters['Total Discounts'],
-                sales_tax: allRevenueCenters['Sales Tax'],
-                total_tax_surcharge_service:
-                    allRevenueCenters['Total Tax Surcharge Service'],
-
-                cash_total: allRevenueCenters['Cash Total'],
-                credit_total: allRevenueCenters['Credit Total'],
-                visa_total: allRevenueCenters['Visa Total'],
-                mastercard_total: allRevenueCenters['Mastercard Total'],
-                american_express_total:
-                    allRevenueCenters['American Express Total'],
-                discover_total: allRevenueCenters['Discover Total'],
-                custom_payment_total:
-                    allRevenueCenters['Custom Payment Total'],
-                uber_eats_total: allRevenueCenters['Uber Eats Total'],
-                dd_marketplace_total:
-                    allRevenueCenters['Dd Marketplace Total'],
-                actual_total_cash_to_business:
-                    allRevenueCenters['Actual Total Cash To Business'],
-                payments_captured_amount:
-                    allRevenueCenters['Payments Captured Amount'],
-
-                refunds_total: allRevenueCenters['Refunds Total'],
-                refunds_count: allRevenueCenters['Refunds Count'],
-                voided_total: allRevenueCenters['Voided Total'],
-                voided_items: allRevenueCenters['Voided Items'],
-
-                adj_non_cash_tips_total_minus_cash:
-                    allRevenueCenters[
-                        'Adj Non Cash Tips Total Minus Cash'
-                    ],
-                total_orders: allRevenueCenters['Total Orders'],
-                avg_sale: allRevenueCenters['Avg Sale'],
-                cash_due_house: allRevenueCenters['Cash Due House'],
-                cash_due_payments:
-                    allRevenueCenters['Cash Due Payments'],
-                cash_payments: allRevenueCenters['Cash Payments'],
-
-                counter_sales_net_sales:
-                    allRevenueCenters['Counter Sales Net Sales'],
-                counter_sales_net_sales_percent:
-                    allRevenueCenters[
-                        'Counter Sales Net Sales Percent'
-                    ],
-                drive_thru_sales_net_sales:
-                    allRevenueCenters['Drive Thru Sales Net Sales'],
-                drive_thru_sales_net_sales_percent:
-                    allRevenueCenters[
-                        'Drive Thru Sales Net Sales Percent'
-                    ],
-
-                // Preserve every field from the source report.
-                raw_data: allRevenueCenters,
-
-                extracted_at: new Date().toISOString(),
-            };
-
-            const {
-                data: savedSupabaseRows,
-                error: supabaseError,
-            } = await supabase
-                .from('daily-sales-summary-all-revenue-operations')
-                .upsert(
-                    dailySalesRow,
-                    {
-                        onConflict: 'id',
-                    },
-                )
-                .select();
-
-            if (supabaseError) {
-                throw new Error(
-                    `Unable to write daily sales to Supabase: `
-                    + `${supabaseError.message}`,
-                );
-            }
+            const intervalCount = intervalRows.filter(
+                (row) => !row.is_total,
+            ).length;
 
             log.info(
-                `Supabase row saved: ${dailySalesRow.id}`,
-                {
-                    location: dailySalesRow.Location,
-                    netSales: dailySalesRow['Net Sales'],
-                },
+                `Parsed ${intervalRows.length} rows `
+                + `(${intervalCount} intervals) from ${source}.`,
             );
 
-            await Actor.pushData({
+            if (supabaseTable) {
+                const { error: supabaseError } = await supabase
+                    .from(supabaseTable)
+                    .upsert(intervalRows, { onConflict: 'id' })
+                    .select();
+
+                if (supabaseError) {
+                    throw new Error(
+                        `Unable to write hourly sales to Supabase: `
+                        + `${supabaseError.message}`,
+                    );
+                }
+
+                log.info(
+                    `Supabase upsert complete: ${intervalRows.length} `
+                    + `rows into "${supabaseTable}".`,
+                );
+            } else {
+                log.info(
+                    'supabaseTable is empty; skipping the Supabase '
+                    + 'upsert.',
+                );
+            }
+
+            await Actor.pushData(intervalRows);
+
+            await Actor.setValue('RUN_SUMMARY', {
                 status: 'success',
                 portalUrl: page.url(),
                 pageTitle: await page.title(),
                 establishment: selectedEstablishment,
-                report: 'Sales Summary',
+                report: 'Hourly Sales',
+                reportView,
+                inclusions,
                 startDate,
                 startTime,
                 startMeridiem: normalizedStartMeridiem,
                 endDate,
                 endTime,
                 endMeridiem: normalizedEndMeridiem,
-                sheetNames: workbook.SheetNames,
-                fieldCountBySheet,
-                // sourceFilename: download.suggestedFilename(),
-                sourceSizeBytes: excelBuffer.length,
+                displayedRange,
+                source,
+                sheetNames,
+                sourceSizeBytes,
+                rowCount: intervalRows.length,
+                intervalCount,
+                supabaseTable: supabaseTable || null,
                 timestamp: new Date().toISOString(),
-                message:
-                    'Logged into Revel, selected Leander, '
-                    + 'applied the Sales Summary date range, '
-                    + 'parsed every worksheet, and saved the daily sales row.',
             });
         },
 
         async failedRequestHandler({ page, request }, error) {
+            requestFailure = error;
+
             log.error(`Revel extraction failed: ${error.message}`);
 
             if (page) {
@@ -1157,7 +1657,7 @@ try {
                 }
             }
 
-            await Actor.pushData({
+            await Actor.setValue('RUN_SUMMARY', {
                 status: 'failed',
                 portalUrl: page
                     ? page.url()
@@ -1166,7 +1666,9 @@ try {
                     ? await page.title().catch(() => '')
                     : '',
                 establishment: targetEstablishment,
-                report: 'Sales Summary',
+                report: 'Hourly Sales',
+                reportView,
+                inclusions,
                 startDate,
                 startTime,
                 startMeridiem: normalizedStartMeridiem,
@@ -1180,6 +1682,8 @@ try {
     });
 
     await crawler.run([url]);
+
+    if (requestFailure) throw requestFailure;
 } catch (error) {
     const failure = error instanceof Error
         ? error

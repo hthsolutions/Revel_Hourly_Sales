@@ -1,16 +1,16 @@
 {
     "$schema": "https://apify.com/schemas/v1/input.ide.json",
-    "title": "Layne's Revel Sales Summary",
-    "description": "Credentials and report settings for the Layne's Revel Sales Summary.",
+    "title": "Layne's Revel Hourly Sales",
+    "description": "Credentials and report settings for the Layne's Revel Hourly Sales report.",
     "type": "object",
     "schemaVersion": 1,
     "properties": {
         "url": {
-            "title": "Revel Sales Summary URL",
+            "title": "Revel Hourly Sales URL",
             "type": "string",
             "editor": "textfield",
-            "description": "URL of the Revel Sales Summary report.",
-            "default": "https://laynes.revelup.com/reports/sales_summary/"
+            "description": "URL of the Revel Hourly Sales report.",
+            "default": "https://laynes.revelup.com/reports/hourly_sales/"
         },
         "username": {
             "title": "Revel username",
@@ -30,7 +30,7 @@
             "title": "Revel establishment",
             "type": "string",
             "editor": "select",
-            "description": "Establishment to select after login. The current Actor version supports Leander only.",
+            "description": "Establishment to select after login.",
             "default": "Leander",
             "enum": [
                 "Lampasas",
@@ -47,7 +47,7 @@
             "title": "Override dates",
             "type": "boolean",
             "editor": "checkbox",
-            "description": "When enabled, the Actor uses override_startDate and override_endDate. When disabled, startDate is yesterday in US Central Time and endDate is today in US Central Time.",
+            "description": "When enabled, the Actor uses override_startDate and override_endDate. When disabled, both dates default to yesterday in US Central Time.",
             "default": false
         },
         "override_startDate": {
@@ -67,28 +67,87 @@
             "type": "string",
             "editor": "textfield",
             "description": "Report start time in HH:MM 12-hour format.",
-            "default": "06:00"
+            "default": "12:00"
         },
         "startMeridiem": {
             "title": "Start AM/PM",
             "type": "string",
-            "editor": "hidden",
-            "description": "The current Actor uses AM for the report start time.",
-            "default": "AM"
+            "editor": "select",
+            "description": "AM or PM for the report start time.",
+            "default": "AM",
+            "enum": [
+                "AM",
+                "PM"
+            ]
         },
         "endTime": {
             "title": "End time",
             "type": "string",
             "editor": "textfield",
             "description": "Report end time in HH:MM 12-hour format.",
-            "default": "06:00"
+            "default": "11:59"
         },
         "endMeridiem": {
             "title": "End AM/PM",
             "type": "string",
-            "editor": "hidden",
-            "description": "The current Actor uses AM for the report end time.",
-            "default": "AM"
+            "editor": "select",
+            "description": "AM or PM for the report end time.",
+            "default": "PM",
+            "enum": [
+                "AM",
+                "PM"
+            ]
+        },
+        "reportView": {
+            "title": "Report view",
+            "type": "string",
+            "editor": "select",
+            "description": "Aggregation interval selected in the report's view dropdown.",
+            "default": "15 Min",
+            "enum": [
+                "Hourly",
+                "15 Min",
+                "Grouped"
+            ]
+        },
+        "inclusions": {
+            "title": "Inclusions",
+            "type": "array",
+            "editor": "select",
+            "description": "Inclusion checkboxes to tick in the Filters panel. Every inclusion left out of this list is unticked.",
+            "default": [
+                "discounts"
+            ],
+            "items": {
+                "type": "string",
+                "enum": [
+                    "open",
+                    "unpaid",
+                    "irregular",
+                    "discounts",
+                    "service_fees",
+                    "taxes",
+                    "web_orders",
+                    "dining_options"
+                ],
+                "enumTitles": [
+                    "Open",
+                    "Unpaid",
+                    "Irregular",
+                    "Discounts",
+                    "Service Fees",
+                    "Taxes",
+                    "Web Orders",
+                    "Dining Options"
+                ]
+            }
+        },
+        "supabaseTable": {
+            "title": "Supabase table",
+            "type": "string",
+            "editor": "textfield",
+            "description": "Table that receives the interval rows. Leave empty to skip the Supabase upsert. Requires the SUPABASE_SERVICE_ROLE_KEY environment variable.",
+            "default": ""
         }
     },
     "required": [
@@ -100,7 +159,8 @@
         "startTime",
         "startMeridiem",
         "endTime",
-        "endMeridiem"
+        "endMeridiem",
+        "reportView"
     ],
     "additionalProperties": false
 }
