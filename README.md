@@ -2,7 +2,7 @@
 
 Apify Actor that signs into the Layne's Revel portal, runs the
 [Hourly Sales report](https://laynes.revelup.com/reports/hourly_sales),
-and returns one dataset row per reporting interval for a given start
+and upserts one Supabase row per reporting interval for a given start
 and end date.
 
 ## What the run does
@@ -30,6 +30,8 @@ and end date.
 7. Exports the report to Excel through the three-dot menu and parses
    every worksheet. If the export is unavailable the Actor falls back
    to scraping the rendered table so the run still produces data.
+8. Drops the `Totals:` row and upserts the interval rows into
+   Supabase.
 
 ## Input
 
@@ -44,35 +46,32 @@ and end date.
 | `endTime` / `endMeridiem` | `11:59` / `PM` | `HH:MM` 12-hour plus `AM`/`PM`. |
 | `reportView` | `15 Min` | `Hourly`, `15 Min` or `Grouped`. |
 | `inclusions` | `["discounts"]` | Any of `open`, `unpaid`, `irregular`, `discounts`, `service_fees`, `taxes`, `web_orders`, `dining_options`. |
-| `supabaseTable` | `""` | Empty skips the Supabase upsert. |
+| `supabaseTable` | `revel_hourly_sales` | Destination table. |
 
 ## Output
 
-Each dataset row represents one interval of one worksheet:
+Each row in `revel_hourly_sales` is one interval:
 
 ```json
 {
-    "id": "2026-09-01_Leander_All revenue centers_06:00 AM - 06:14 AM",
+    "id": "2026-09-01_Leander_Sheet1_06:00 AM - 06:14 AM",
     "location": "Leander",
     "business_date": "2026-09-01",
-    "report_view": "15 Min",
-    "revenue_center": "All revenue centers",
     "interval_label": "06:00 AM - 06:14 AM",
-    "interval_start": "06:00",
     "interval_end": "06:14",
-    "is_total": false,
+    "time": "06:00 AM - 06:14 AM",
     "transactions": 35,
     "items": 213,
     "avg_sales_per_check": 22.72,
     "sales": 795.12,
-    "sales_percent": 12,
-    "raw_data": { "...": "every column from the source report" },
     "extracted_at": "2026-09-02T11:04:12.331Z"
 }
 ```
 
-Rows that Revel emits as report totals rather than intervals keep
-`is_total: true` and null interval times.
+`transactions`, `items`, `avg_sales_per_check`, `sales` and `time` come
+from the Excel columns `# Transactions`, `# Items`, `Avg. Sales/Check`,
+`Sales` and `Time`. Revel shows `-` for the average in intervals with no
+checks, which is stored as `null`.
 
 A `RUN_SUMMARY` record plus step-by-step screenshots
 (`REVEL_LOGIN_START`, `REVEL_FILTERS_SELECTED`, `REVEL_REPORT_READY`,
@@ -81,11 +80,15 @@ to diagnose a selector that Revel has changed.
 
 ## Supabase
 
-The upsert is optional. Set `supabaseTable` to the destination table
-and provide `SUPABASE_SERVICE_ROLE_KEY` (and optionally `SUPABASE_URL`)
-as environment variables. The table needs a unique `id` column, since
-rows are upserted with `onConflict: 'id'`. Leaving `supabaseTable`
-empty skips the write entirely and the dataset is still populated.
+Supabase is the Actor's only output; nothing is written to the Apify
+dataset. Create the table once with `supabase/revel_hourly_sales.sql`,
+then set `SUPABASE_SERVICE_ROLE_KEY` (and optionally `SUPABASE_URL`) as
+secret environment variables on the Actor. The run fails before logging
+in to Revel if the key is missing.
+
+Rows are upserted on `id`, so re-running a date updates its rows
+rather than duplicating them. The report's `Totals:` row
+(`is_total: true`) is dropped before the write.
 
 ## Local development
 

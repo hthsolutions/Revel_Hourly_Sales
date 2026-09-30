@@ -75,6 +75,7 @@ const COLUMN_ALIASES = {
     ],
     sales: ['sales', 'net sales'],
     sales_percent: ['% sales', 'sales %', '% of sales'],
+    time: ['time', 'interval'],
 };
 
 /**
@@ -346,6 +347,29 @@ function buildIntervalRows({
     }
 
     return rows;
+}
+
+/**
+ * Shape an interval row for the revel_hourly_sales table. Columns
+ * must match supabase/revel_hourly_sales.sql exactly, since
+ * PostgREST rejects the whole batch on an unknown column.
+ */
+function toSupabaseRow(row) {
+    const time = findColumnValue(row.raw_data, COLUMN_ALIASES.time);
+
+    return {
+        id: row.id,
+        location: row.location,
+        business_date: row.business_date,
+        interval_label: row.interval_label,
+        interval_end: row.interval_end,
+        time: time === null ? null : String(time).trim(),
+        transactions: row.transactions,
+        items: row.items,
+        avg_sales_per_check: row.avg_sales_per_check,
+        sales: row.sales,
+        extracted_at: row.extracted_at,
+    };
 }
 
 /**
@@ -1197,7 +1221,7 @@ try {
         endMeridiem = 'PM',
         reportView = '15 Min',
         inclusions = ['discounts'],
-        supabaseTable = '',
+        supabaseTable = 'revel_hourly_sales',
     } = input ?? {};
 
     let startDate;
@@ -1233,7 +1257,7 @@ try {
         endMeridiem,
         reportView,
         inclusions,
-        supabaseTable: supabaseTable || '(disabled)',
+        supabaseTable,
     });
 
     if (!username || !password) {
@@ -1287,10 +1311,18 @@ try {
         );
     }
 
-    if (supabaseTable && !supabase) {
+    /*
+     * Supabase is the only destination for the rows, so fail before
+     * logging in rather than after a full scrape.
+     */
+    if (!supabaseTable) {
+        throw new Error('supabaseTable is required.');
+    }
+
+    if (!supabase) {
         throw new Error(
-            'supabaseTable is set but SUPABASE_SERVICE_ROLE_KEY is '
-            + 'not configured.',
+            'SUPABASE_SERVICE_ROLE_KEY is not configured. Add it to '
+            + 'the Actor\'s environment variables as a secret.',
         );
     }
 
@@ -2022,31 +2054,34 @@ try {
                 + `(${intervalCount} intervals) from ${source}.`,
             );
 
-            if (supabaseTable) {
-                const { error: supabaseError } = await supabase
-                    .from(supabaseTable)
-                    .upsert(intervalRows, { onConflict: 'id' })
-                    .select();
+            const supabaseRows = intervalRows
+                .filter((row) => !row.is_total)
+                .map(toSupabaseRow);
 
-                if (supabaseError) {
-                    throw new Error(
-                        `Unable to write hourly sales to Supabase: `
-                        + `${supabaseError.message}`,
-                    );
-                }
-
-                log.info(
-                    `Supabase upsert complete: ${intervalRows.length} `
-                    + `rows into "${supabaseTable}".`,
-                );
-            } else {
-                log.info(
-                    'supabaseTable is empty; skipping the Supabase '
-                    + 'upsert.',
+            if (supabaseRows.length === 0) {
+                throw new Error(
+                    'The Hourly Sales report produced no interval rows '
+                    + 'to write to Supabase.',
                 );
             }
 
-            await Actor.pushData(intervalRows);
+            const { error: supabaseError } = await supabase
+                .from(supabaseTable)
+                .upsert(supabaseRows, { onConflict: 'id' });
+
+            if (supabaseError) {
+                throw new Error(
+                    `Unable to write hourly sales to Supabase: `
+                    + `${supabaseError.message}`,
+                );
+            }
+
+            log.info(
+                `Supabase upsert complete: ${supabaseRows.length} `
+                + `rows into "${supabaseTable}" `
+                + `(${intervalRows.length - supabaseRows.length} `
+                + `total rows skipped).`,
+            );
 
             await Actor.setValue('RUN_SUMMARY', {
                 status: 'success',
@@ -2068,7 +2103,8 @@ try {
                 sourceSizeBytes,
                 rowCount: intervalRows.length,
                 intervalCount,
-                supabaseTable: supabaseTable || null,
+                supabaseTable,
+                supabaseRowCount: supabaseRows.length,
                 timestamp: new Date().toISOString(),
             });
         },

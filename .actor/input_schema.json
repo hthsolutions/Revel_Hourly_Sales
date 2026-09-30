@@ -146,8 +146,8 @@
             "title": "Supabase table",
             "type": "string",
             "editor": "textfield",
-            "description": "Table that receives the interval rows. Leave empty to skip the Supabase upsert. Requires the SUPABASE_SERVICE_ROLE_KEY environment variable.",
-            "default": ""
+            "description": "Supabase table that receives one row per interval; total rows are skipped. Create it with supabase/revel_hourly_sales.sql. Requires the SUPABASE_SERVICE_ROLE_KEY environment variable.",
+            "default": "revel_hourly_sales"
         }
     },
     "required": [
