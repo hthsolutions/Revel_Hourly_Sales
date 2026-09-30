@@ -4,6 +4,7 @@
         "apify": "^3.4.0",
         "crawlee": "^3.15.0",
         "playwright": "*",
+        "xlsx": "^0.18.5",
         "@supabase/supabase-js": "^2.57.0"
     },
     "scripts": {
