@@ -14,6 +14,28 @@ const supabaseUrl =
 const supabaseServiceRoleKey =
     process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+/**
+ * Identify which kind of Supabase key was supplied. Only a service
+ * role key bypasses row level security; an anon or publishable key
+ * fails every write with "new row violates row-level security".
+ * Legacy keys are JWTs whose payload names the role; newer keys
+ * carry it in their prefix.
+ */
+function supabaseKeyRole(key) {
+    if (key.startsWith('sb_secret_')) return 'service_role';
+    if (key.startsWith('sb_publishable_')) return 'publishable';
+
+    try {
+        const payload = key.split('.')[1];
+
+        return JSON.parse(
+            Buffer.from(payload, 'base64url').toString('utf8'),
+        ).role ?? 'unknown';
+    } catch {
+        return 'unknown';
+    }
+}
+
 const supabase = supabaseServiceRoleKey
     ? createClient(
         supabaseUrl,
@@ -1323,6 +1345,24 @@ try {
         throw new Error(
             'SUPABASE_SERVICE_ROLE_KEY is not configured. Add it to '
             + 'the Actor\'s environment variables as a secret.',
+        );
+    }
+
+    const keyRole = supabaseKeyRole(supabaseServiceRoleKey);
+
+    if (keyRole === 'anon' || keyRole === 'publishable') {
+        throw new Error(
+            `SUPABASE_SERVICE_ROLE_KEY holds the ${keyRole} key, which `
+            + 'row level security blocks from writing. Use the '
+            + 'service_role (secret) key from Supabase Project '
+            + 'Settings > API Keys.',
+        );
+    }
+
+    if (keyRole !== 'service_role') {
+        log.warning(
+            `Could not confirm SUPABASE_SERVICE_ROLE_KEY is a service `
+            + `role key (detected: ${keyRole}).`,
         );
     }
 
