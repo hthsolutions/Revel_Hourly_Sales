@@ -35,12 +35,14 @@
             "enum": [
                 "Lampasas",
                 "Leander",
-                "Marble Falls"
+                "Marble Falls",
+                "Temple"
             ],
             "enumTitles": [
                 "41 | Lampasas",
                 "42 | Leander",
-                "29 | Marble Falls"
+                "29 | Marble Falls",
+                "62 | Temple"
             ]
         },
         "override_flag": {

@@ -59,6 +59,7 @@ const ESTABLISHMENT_CODES = {
     Lampasas: '41',
     Leander: '42',
     'Marble Falls': '29',
+    Temple: '62',
 };
 
 /**

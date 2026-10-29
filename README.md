@@ -39,7 +39,7 @@ and end date.
 | --- | --- | --- |
 | `url` | `https://laynes.revelup.com/reports/hourly_sales/` | Report to open. |
 | `username`, `password` | — | Revel credentials. Marked secret. |
-| `establishment` | `Leander` | `Lampasas`, `Leander` or `Marble Falls`. |
+| `establishment` | `Leander` | `Lampasas`, `Leander`, `Marble Falls` or `Temple`. |
 | `override_flag` | `false` | When `false`, both dates default to yesterday in US Central Time. |
 | `override_startDate`, `override_endDate` | — | `MM/DD/YYYY`. Required when `override_flag` is `true`. |
 | `startTime` / `startMeridiem` | `12:00` / `AM` | `HH:MM` 12-hour plus `AM`/`PM`. |
